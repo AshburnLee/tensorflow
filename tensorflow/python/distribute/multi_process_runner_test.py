@@ -514,6 +514,23 @@ class MultiProcessRunnerTest(test.TestCase):
     while mpr.process_exists('worker', 0):
       time.sleep(1)
 
+  def test_timeout_none(self):
+
+    def proc_func():
+      time.sleep(250)
+      raise ValueError('Worker 0 errored')
+
+    mpr = multi_process_runner.MultiProcessRunner(
+        proc_func, multi_worker_test_base.create_cluster_spec(num_workers=1))
+
+    mpr.start()
+    with self.assertRaisesRegex(ValueError, 'Worker 0 errored'):
+      mpr.join(timeout=None)
+
+
+_global_pool = multi_process_runner.MultiProcessPoolRunner(
+    multi_worker_test_base.create_cluster_spec(num_workers=2))
+
 
 class MultiProcessPoolRunnerTest(test.TestCase):
 
@@ -562,6 +579,18 @@ class MultiProcessPoolRunnerTest(test.TestCase):
         cluster_spec, initializer=lambda: proc_func_that_sets_global(1))
     result = runner.run(proc_func_that_sets_global, args=(2,))
     self.assertAllEqual(result, [1, 1])
+
+  def test_global_pool(self):
+    _global_pool.run(proc_func_that_does_nothing)
+
+  def test_nested_pool(self):
+
+    def proc_func():
+      # This runs in sub processes, so they are each using their own
+      # MultiProcessPoolRunner.
+      _global_pool.run(proc_func_that_does_nothing)
+
+    _global_pool.run(proc_func)
 
 
 if __name__ == '__main__':

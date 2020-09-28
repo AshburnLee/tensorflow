@@ -19,6 +19,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import atexit
 import collections
 import contextlib
 import json
@@ -28,6 +29,7 @@ import sys
 import threading
 import time
 import unittest
+import weakref
 
 from absl import logging
 import six
@@ -562,8 +564,10 @@ class MultiProcessRunner(object):
     race is removed.
 
     Args:
-      timeout: if set and not all processes report status within roughly
-        `timeout` seconds, a `SubprocessTimeoutError` exception will be raised.
+      timeout: optional integer or `None`. If provided as an integer, and not
+      all processes report status within roughly `timeout` seconds, a
+      `SubprocessTimeoutError` exception will be raised. If `None`, `join` never
+      times out.
 
     Returns:
       A MultiProcessRunnerResult object, which has two attributes,
@@ -591,6 +595,8 @@ class MultiProcessRunner(object):
         `UnexpectedSubprocessExitError`'s mpr_result attribute, which has the
         same structure as above 'Returns' section describes.
     """
+    if timeout and not isinstance(timeout, int):
+      raise ValueError('`timeout` must be an integer or `None`.')
     with self._process_lock:
       if self._joined:
         raise ValueError("MultiProcessRunner can't be joined twice.")
@@ -844,6 +850,20 @@ class _ProcFunc(object):
     sys.exit(0)
 
 
+# Active MultiProcessPoolRunner. We need to shut them down when the program
+# exits. For the main process, we do this via atexit callback. For a process
+# that is spawned by MultiProcessPoolRunner, e.g. nested MultiProcessPoolRunner,
+# we do this manually at the end of _pool_runner_worker. The reason is that
+# multiprocessing library waits for all spawned processes to exit, so atexit
+# callbacks won't trigger until all pools are shutdown.
+_active_pool_runners = weakref.WeakSet()
+
+
+def _shutdown_all_pool_runners():
+  for pool in _active_pool_runners:
+    pool.shutdown()
+
+
 class MultiProcessPoolRunner(object):
   """A utility class to start a process pool to simulate a cluster.
 
@@ -866,6 +886,7 @@ class MultiProcessPoolRunner(object):
       RuntimeError: if `multi_process_runner.test_main()` is not called.
       ValueError: if there are more than one chief in the `cluster_spec`.
     """
+    _active_pool_runners.add(self)
     self._cluster_spec = cluster_spec
     self._initializer = initializer
     self._conn = {}
@@ -880,18 +901,18 @@ class MultiProcessPoolRunner(object):
       conn.close()
     self._conn = {}
     if self._runner is not None:
-      self._runner.join()
+      try:
+        self._runner.join()
+      except Exception as e:  # pylint: disable=broad-except
+        logging.error(
+            'Ignoring exception when shutting down MultiProcessPoolRunner: %s',
+            e)
       self._runner = None
 
   def _start(self):
     """Starts the worker pool."""
     # We need different arguments for different processes so we're passing a
     # no-op proc_func here and use start_single_process instead.
-    #
-    # We also need to start the process pool as daemon, so that they don't block
-    # the program from exiting. Note that __del__ may not get called when
-    # there's an exception. The user may also store a pool runner in a global
-    # object to share across test cases
 
     if dill is None:
       raise unittest.SkipTest(
@@ -900,8 +921,7 @@ class MultiProcessPoolRunner(object):
     self._runner = MultiProcessRunner(
         proc_func=lambda: None,
         cluster_spec=self._cluster_spec,
-        use_dill_for_args=False,
-        daemon=True)
+        use_dill_for_args=False)
     if self._initializer:
       initializer = dill.dumps(self._initializer, dill.HIGHEST_PROTOCOL)
     else:
@@ -915,6 +935,10 @@ class MultiProcessPoolRunner(object):
             task_id,
             proc_func=_pool_runner_worker,
             args=(task_type, task_id, initializer, conn2))
+    # In the case MultiProcessPoolRunner is not GC-ed, we register an atexit
+    # callback to shut them down. For example, when there're global
+    # MultiProcessPoolRunner.
+    atexit.register(_shutdown_all_pool_runners)
 
   def run(self, proc_func, args=None, kwargs=None):
     """Runs `proc_func` with `args` and `kwargs` on all jobs.
@@ -986,6 +1010,12 @@ def _pool_runner_worker(task_type, task_id, initializer, conn):
     sys.stdout.flush()
     sys.stderr.flush()
     conn.send(info)
+  # Shutdown all MultiProcessPoolRunner in this process manually.
+  # MultiProcessPoolRunner registers an atexit callback to shutdown all pool
+  # runners, but we cannot rely on that in processes spawned by the
+  # multiprocessing library. This is because the library waits for all
+  # subprocesses before exiting and thus all atexit callbacks.
+  _shutdown_all_pool_runners()
 
 
 def _run_contained(task_type, task_id, proc_func, args, kwargs):

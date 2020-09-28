@@ -97,6 +97,7 @@ cuda_py_test(
         "no_windows",
         "nomac",
     ],
+    tfrt_enabled = True,
     xla_enable_strict_auto_jit = False,
     deps = [
         ":trt_convert_py",
@@ -169,7 +170,6 @@ cuda_py_test(
     ],
     python_version = "PY3",
     tags = [
-        "no_cuda11",  # TODO(b/166308253): enable the test for CUDA 11.
         "no_cuda_on_cpu_tap",
         "no_oss",  # TODO(b/125290478): allow running in at least some OSS configurations.
         "no_pip",
@@ -177,6 +177,7 @@ cuda_py_test(
         "no_windows",
         "nomac",
     ],
+    tfrt_enabled = True,
     xla_enable_strict_auto_jit = False,
     deps = [
         ":tf_trt_integration_test_base",

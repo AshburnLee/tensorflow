@@ -1,3 +1,4 @@
+load("//tensorflow/core/platform:rules_cc.bzl", "cc_library")
 load("//tensorflow:tensorflow.bzl", "tf_cc_test")
 
 package(
@@ -231,6 +232,7 @@ cc_library(
     hdrs = ["xplane_to_op_stats.h"],
     deps = [
         ":op_metrics_db_combiner",
+        ":op_stats_combiner",
         ":step_events_to_steps_db",
         ":xplane_to_kernel_stats_db",
         ":xplane_to_op_metrics_db",
@@ -248,6 +250,7 @@ cc_library(
         "//tensorflow/core/profiler/utils:event_span",
         "//tensorflow/core/profiler/utils:hardware_type_utils",
         "//tensorflow/core/profiler/utils:kernel_stats_utils",
+        "//tensorflow/core/profiler/utils:step_intersection",
         "//tensorflow/core/profiler/utils:tf_op_utils",
         "//tensorflow/core/profiler/utils:tf_xplane_visitor",
         "//tensorflow/core/profiler/utils:xplane_schema",
@@ -555,7 +558,24 @@ cc_library(
         "//tensorflow/core/profiler/protobuf:op_stats_proto_cc",
         "//tensorflow/core/profiler/protobuf:steps_db_proto_cc",
         "//tensorflow/core/profiler/utils:hardware_type_utils",
-        "//tensorflow/core/profiler/utils:step_interval",
+        "//tensorflow/core/profiler/utils:kernel_stats_utils",
+        "//tensorflow/core/profiler/utils:step_intersection",
         "@com_google_absl//absl/container:flat_hash_map",
+    ],
+)
+
+cc_library(
+    name = "post_process_single_host_xplane",
+    srcs = ["post_process_single_host_xplane.cc"],
+    hdrs = ["post_process_single_host_xplane.h"],
+    visibility = ["//tensorflow/core/profiler:internal"],
+    deps = [
+        "//tensorflow/core:lib",
+        "//tensorflow/core/profiler/internal:profiler_factory",
+        "//tensorflow/core/profiler/protobuf:xplane_proto_cc",
+        "//tensorflow/core/profiler/utils:derived_timeline",
+        "//tensorflow/core/profiler/utils:group_events",
+        "//tensorflow/core/profiler/utils:xplane_schema",
+        "//tensorflow/core/profiler/utils:xplane_utils",
     ],
 )

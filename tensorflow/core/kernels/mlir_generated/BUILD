@@ -1,19 +1,26 @@
 # Generates CUDA kernels using MLIR codegen.
 
-load("//tensorflow/core/kernels/mlir_generated:build_defs.bzl", "gen_kernel_library", "if_mlir_generated_gpu_kernels_enabled")
+load(
+    "//tensorflow/core/kernels/mlir_generated:build_defs.bzl",
+    "gen_kernel_library",
+    "if_mlir_generated_gpu_kernels_enabled",
+)
 load(
     "//tensorflow:tensorflow.bzl",
     "if_cuda_or_rocm",
-    "tf_kernel_library",
 )
-load("//tensorflow:tensorflow.bzl", "tf_cuda_cc_test")
+load("//tensorflow:tensorflow.bzl", "tf_cuda_cc_test")  # buildifier: disable=same-origin-load
+load("//tensorflow:tensorflow.bzl", "tf_kernel_library")  # buildifier: disable=same-origin-load
 load(
     "//tensorflow/core/platform:build_config_root.bzl",
     "tf_cuda_tests_tags",
 )
 
 package(
-    default_visibility = ["//tensorflow/core/kernels:__subpackages__"],
+    default_visibility = [
+        "//tensorflow/compiler/mlir/tools/kernel_gen:__subpackages__",
+        "//tensorflow/core/kernels:__subpackages__",
+    ],
     licenses = ["notice"],  # Apache 2.0
 )
 
@@ -25,20 +32,25 @@ config_setting(
 )
 
 tf_kernel_library(
-    name = "cwise_op",
-    gpu_srcs = [
-        "cwise_op_gpu_base.cu.cc",
-        "cwise_op_gpu_base.cu.h",
-        "cwise_op_gpu_abs.cu.cc",
-        "cwise_op_gpu_tanh.cu.cc",
-    ],
-    tags = ["manual"],
+    name = "cwise_unary_op",
+    # Technically these source files don't need --config=cuda or --config=rocm,
+    # but we want to avoid building them if they are not needed.
+    srcs = if_cuda_or_rocm([
+        "cwise_op_gpu_abs.cc",
+        "cwise_op_gpu_base.cc",
+        "cwise_op_gpu_base.h",
+        "cwise_op_gpu_tanh.cc",
+    ]),
+    # Building abs_kernels and tanh_kernels requires hexdump on the ROCM
+    # platform, which might not be available.
+    tags = ["no_rocm"],
     deps = if_cuda_or_rocm([
         ":abs_kernels",
         ":tanh_kernels",
         "@com_google_absl//absl/strings",
-        "//third_party/eigen3",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "//third_party/eigen3",
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core:stream_executor",
@@ -49,7 +61,7 @@ tf_cuda_cc_test(
     name = "gpu_tanh_test",
     size = "small",
     srcs = if_mlir_generated_gpu_kernels_enabled(["gpu_tanh_test.cc"]),
-    tags = tf_cuda_tests_tags() + ["no_rocm"],
+    tags = tf_cuda_tests_tags(),
     deps = [
         "//tensorflow/core:framework",
         "//tensorflow/core:framework_internal",
@@ -68,7 +80,7 @@ tf_cuda_cc_test(
     name = "gpu_abs_test",
     size = "small",
     srcs = if_mlir_generated_gpu_kernels_enabled(["gpu_abs_test.cc"]),
-    tags = tf_cuda_tests_tags() + ["no_rocm"],
+    tags = tf_cuda_tests_tags(),
     deps = [
         "//tensorflow/core:framework",
         "//tensorflow/core:framework_internal",
