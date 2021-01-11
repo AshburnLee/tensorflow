@@ -46,12 +46,13 @@ from tensorflow.python.keras import regularizers
 from tensorflow.python.keras.engine import base_layer
 from tensorflow.python.keras.engine import base_layer_utils
 from tensorflow.python.keras.engine import input_spec
-from tensorflow.python.keras.mixed_precision.experimental import autocast_variable
-from tensorflow.python.keras.mixed_precision.experimental import loss_scale_optimizer
-from tensorflow.python.keras.mixed_precision.experimental import policy
+from tensorflow.python.keras.mixed_precision import autocast_variable
+from tensorflow.python.keras.mixed_precision import loss_scale_optimizer
+from tensorflow.python.keras.mixed_precision import policy
 from tensorflow.python.keras.saving.saved_model import layer_serialization
 from tensorflow.python.keras.utils import generic_utils
 from tensorflow.python.keras.utils import layer_utils
+from tensorflow.python.keras.utils import object_identity
 from tensorflow.python.keras.utils import tf_inspect
 from tensorflow.python.keras.utils import tf_utils
 # A module that only depends on `keras.layers` import these from here.
@@ -68,7 +69,6 @@ from tensorflow.python.training.tracking import base as trackable
 from tensorflow.python.training.tracking import data_structures
 from tensorflow.python.training.tracking import tracking
 from tensorflow.python.util import nest
-from tensorflow.python.util import object_identity
 from tensorflow.tools.docs import doc_controls
 
 
@@ -96,7 +96,7 @@ class Layer(base_layer.Layer):
     once. Should actually perform the logic of applying the layer to the
     input tensors (which should be passed in as the first argument).
 
-  Arguments:
+  Args:
     trainable: Boolean, whether the layer's variables should be trainable.
     name: String name of the layer.
     dtype: The dtype of the layer's computations and weights (default of
@@ -112,9 +112,9 @@ class Layer(base_layer.Layer):
   Attributes:
     name: The name of the layer (string).
     dtype: The dtype of the layer's computations and weights. If mixed
-      precision is used with a `tf.keras.mixed_precision.experimental.Policy`,
-      this is instead just the dtype of the layer's weights, as the computations
-      are done in a different dtype.
+      precision is used with a `tf.keras.mixed_precision.Policy`, this is
+      instead just the dtype of the layer's weights, as the computations are
+      done in a different dtype.
     updates: List of update ops of this layer.
     losses: List of losses added by this layer.
     trainable_weights: List of variables to be included in backprop.
@@ -133,8 +133,7 @@ class Layer(base_layer.Layer):
   if no dtype is passed. `floatx()` itself defaults to "float32". Additionally,
   layers will cast their inputs to the layer's dtype in TensorFlow 2. When mixed
   precision is used, layers may have different computation and variable dtypes.
-  See `tf.keras.mixed_precision.experimental.Policy` for details on layer
-  dtypes.
+  See `tf.keras.mixed_precision.Policy` for details on layer dtypes.
   """
 
   # See tf.Module for the usage of this property.
@@ -152,8 +151,8 @@ class Layer(base_layer.Layer):
   @trackable.no_automatic_dependency_tracking
   def __init__(self, trainable=True, name=None, dtype=None, dynamic=False,
                **kwargs):
-    base_layer.keras_api_gauge.get_cell('layer').set(True)
-    base_layer.keras_layers_gauge.get_cell(self.__class__.__name__).set(True)
+    self._instrument_layer_creation()
+
     # These properties should be set by the user via keyword arguments.
     # note that 'dtype', 'input_shape' and 'batch_input_shape'
     # are only applicable to input layers: do not pass these keywords
@@ -199,9 +198,11 @@ class Layer(base_layer.Layer):
     self._metrics = []
 
     # Both graph and subclassed networks have a dtype policy. For graph
-    # networks, the policy's compute and variable dtypes are ignored, but other
-    # fields, like the loss scale, are used by Models. For subclassed networks,
-    # the compute and variable dtypes are used as like any ordinary layer.
+    # networks, the policy's compute and variable dtypes are ignored. Such
+    # networks only use the policy if it is a PolicyV1, in which case it uses
+    # the PolicyV1's loss_scale (Policy does not have a loss_scale). For
+    # subclassed networks, the compute and variable dtypes are used as like any
+    # ordinary layer.
     self._set_dtype_policy(dtype)
     # Boolean indicating whether the layer automatically casts its inputs to the
     # layer's compute_dtype.
@@ -211,7 +212,7 @@ class Layer(base_layer.Layer):
     # Dependencies tracked via attribute assignment.
     # All layers in order of horizontal graph traversal.
     # Entries are unique. For models includes input and output layers.
-    self._maybe_create_attribute('_layers', [])
+    self._maybe_create_attribute('_self_tracked_trackables', [])
 
     # These lists will be filled via successive calls
     # to self._add_inbound_node().
@@ -273,7 +274,7 @@ class Layer(base_layer.Layer):
 
     This is typically used to create the weights of `Layer` subclasses.
 
-    Arguments:
+    Args:
       input_shape: Instance of `TensorShape`, or list of instances of
         `TensorShape` if the layer expects a list of inputs
         (one instance per input).
@@ -286,7 +287,7 @@ class Layer(base_layer.Layer):
   def call(self, inputs, **kwargs):  # pylint: disable=unused-argument
     """This is where the layer's logic lives.
 
-    Arguments:
+    Args:
         inputs: Input tensor, or list/tuple of input tensors.
         **kwargs: Additional keyword arguments.
 
@@ -299,7 +300,7 @@ class Layer(base_layer.Layer):
   def _add_trackable(self, trackable_object, trainable):
     """Adds a Trackable object to this layer's state.
 
-    Arguments:
+    Args:
       trackable_object: The tf.tracking.Trackable object to add.
       trainable: Boolean, whether the variable should be part of the layer's
         "trainable_variables" (e.g. variables, biases) or
@@ -331,7 +332,7 @@ class Layer(base_layer.Layer):
                  **kwargs):
     """Adds a new variable to the layer.
 
-    Arguments:
+    Args:
       name: Variable name.
       shape: Variable shape. Defaults to scalar if unspecified.
       dtype: The type of the variable. Defaults to `self.dtype` or `float32`.
@@ -420,8 +421,9 @@ class Layer(base_layer.Layer):
         raise ValueError('An initializer for variable %s of type %s is required'
                          ' for layer %s' % (name, dtype.base_dtype, self.name))
 
-    if (autocast and self._dtype_policy.should_cast_variables and
-        dtype.is_floating):
+    if (autocast and
+        self._dtype_policy.compute_dtype != self._dtype_policy.variable_dtype
+        and dtype.is_floating):
       # Wrap 'getter' with a version that returns an AutoCastVariable.
       old_getter = getter
       def getter(*args, **kwargs):  # pylint: disable=function-redefined
@@ -522,7 +524,7 @@ class Layer(base_layer.Layer):
     dictionary. It does not handle layer connectivity
     (handled by Network), nor weights (handled by `set_weights`).
 
-    Arguments:
+    Args:
         config: A Python dictionary, typically the
             output of get_config.
 
@@ -538,7 +540,7 @@ class Layer(base_layer.Layer):
     layer. This assumes that the layer will later be used with inputs that
     match the input shape provided here.
 
-    Arguments:
+    Args:
         input_shape: Shape tuple (tuple of integers)
             or list of shape tuples (one per output tensor of the layer).
             Shape tuples can include None for free dimensions,
@@ -598,9 +600,8 @@ class Layer(base_layer.Layer):
     """
     def check_type_return_shape(s):
       if not isinstance(s, tensor_spec.TensorSpec):
-        raise TypeError(
-            'Only TensorSpec signature types are supported, '
-            'but saw signature signature entry: {}.'.format(s))
+        raise TypeError('Only TensorSpec signature types are supported, '
+                        'but saw signature entry: {}.'.format(s))
       return s.shape
     input_shape = nest.map_structure(check_type_return_shape, input_signature)
     output_shape = self.compute_output_shape(input_shape)
@@ -618,7 +619,7 @@ class Layer(base_layer.Layer):
   def compute_mask(self, inputs, mask=None):  # pylint: disable=unused-argument
     """Computes an output mask tensor.
 
-    Arguments:
+    Args:
         inputs: Tensor or list of tensors.
         mask: Tensor or list of tensors.
 
@@ -639,7 +640,7 @@ class Layer(base_layer.Layer):
   def __call__(self, *args, **kwargs):
     """Wraps `call`, applying pre- and post-processing steps.
 
-    Arguments:
+    Args:
       *args: Positional arguments to be passed to `self.call`.
       **kwargs: Keyword arguments to be passed to `self.call`.
 
@@ -734,7 +735,7 @@ class Layer(base_layer.Layer):
       if self._expects_training_arg and training_value is not None:
         # Force the training_value to be bool type which matches to the contract
         # for layer/model call args.
-        if tensor_util.is_tensor(training_value):
+        if tensor_util.is_tf_type(training_value):
           training_value = math_ops.cast(training_value, dtypes.bool)
         else:
           training_value = bool(training_value)
@@ -835,8 +836,9 @@ class Layer(base_layer.Layer):
   def _assert_built_as_v1(self):
     if not hasattr(self, '_originally_built_as_v1'):
       raise ValueError(
-          'Your Layer or Model is in an invalid state. This can happen if you '
-          'are interleaving estimator/non-estimator models or '
+          'Your Layer or Model is in an invalid state. '
+          'This can happen for the following cases:\n '
+          '1. You might be interleaving estimator/non-estimator models or '
           'interleaving models/layers made in tf.compat.v1.Graph.as_default() '
           'with models/layers created outside of it. '
           'Converting a model to an estimator (via model_to_estimator) '
@@ -844,7 +846,11 @@ class Layer(base_layer.Layer):
           'if they were not the model converted to an estimator). '
           'Similarly, making a layer or a model inside a '
           'a tf.compat.v1.Graph invalidates all layers/models you previously '
-          'made outside of the graph.')
+          'made outside of the graph.\n'
+          '2. You might be using a custom keras layer implementation with '
+          ' custom __init__ which didn\'t call super().__init__. '
+          ' Please check the implementation of %s and its bases.' %
+          (type(self),))
 
   @property
   def dtype(self):
@@ -874,7 +880,7 @@ class Layer(base_layer.Layer):
   @trainable.setter
   def trainable(self, value):
     self._trainable = value
-    for layer in getattr(self, '_layers', []):
+    for layer in getattr(self, '_self_tracked_trackables', []):
       layer.trainable = value
 
   @property
@@ -903,36 +909,6 @@ class Layer(base_layer.Layer):
     self._input_spec = value
 
   @property
-  def trainable_weights(self):
-    if self.trainable:
-      children_weights = self._gather_children_attribute('trainable_weights')
-      return self._dedup_weights(self._trainable_weights + children_weights)
-    else:
-      return []
-
-  @property
-  def non_trainable_weights(self):
-    if self.trainable:
-      children_weights = self._gather_children_attribute(
-          'non_trainable_weights')
-      non_trainable_weights = self._non_trainable_weights + children_weights
-    else:
-      children_weights = self._gather_children_attribute('weights')
-      non_trainable_weights = (
-          self._trainable_weights + self._non_trainable_weights +
-          children_weights)
-    return self._dedup_weights(non_trainable_weights)
-
-  @property
-  def weights(self):
-    """Returns the list of all layer variables/weights.
-
-    Returns:
-      A list of variables.
-    """
-    return self.trainable_weights + self.non_trainable_weights
-
-  @property
   def updates(self):
     collected_updates = []
     all_layers = self._flatten_layers()
@@ -944,9 +920,15 @@ class Layer(base_layer.Layer):
           if callable(u):
             try:
               u = u()
-            except errors.InaccessibleTensorError:
-              base_layer_utils.check_graph_consistency(
-                  method='add_update', force_raise=True)
+            except ValueError as e:
+              if 'InaccessibleTensorError' in type(e).__name__:
+                # For one specific case of error we try to raise
+                # a more meaningful error message about the graph if we can.
+                # This error is an internal TF symbol that is not
+                # publicly exposed, so we check the name directly rather
+                # than using a direct import.
+                base_layer_utils.check_graph_consistency(
+                    method='add_update', force_raise=True)
               raise  # check_graph_consistency may not always raise.
           base_layer_utils.check_graph_consistency(u, method='add_update')
           collected_updates.append(u)
@@ -1010,7 +992,7 @@ class Layer(base_layer.Layer):
     x = tf.keras.layers.Dense(10)(inputs)
     outputs = tf.keras.layers.Dense(1)(x)
     model = tf.keras.Model(inputs, outputs)
-    # Actvity regularization.
+    # Activity regularization.
     model.add_loss(tf.abs(tf.reduce_mean(x)))
     ```
 
@@ -1033,7 +1015,7 @@ class Layer(base_layer.Layer):
     The `get_losses_for` method allows to retrieve the losses relevant to a
     specific set of inputs.
 
-    Arguments:
+    Args:
       losses: Loss tensor, or list/tuple of tensors. Rather than tensors, losses
         may also be zero-argument callables which create a loss tensor.
       inputs: Ignored when executing eagerly. If anything other than None is
@@ -1053,7 +1035,7 @@ class Layer(base_layer.Layer):
           loss = loss()
       if loss is None:
         return None  # Will be filtered out when computing the .losses property
-      if not tensor_util.is_tensor(loss):
+      if not tensor_util.is_tf_type(loss):
         loss = ops.convert_to_tensor_v2_with_dispatch(
             loss, dtype=backend.floatx())
       loss._unconditional_loss = (inputs is None)  # pylint: disable=protected-access
@@ -1069,7 +1051,7 @@ class Layer(base_layer.Layer):
         continue
       if loss is None:
         continue
-      if not tensor_util.is_tensor(loss):
+      if not tensor_util.is_tf_type(loss):
         loss = ops.convert_to_tensor_v2_with_dispatch(
             loss, dtype=backend.floatx())
       # TF Functions should take the eager path.
@@ -1186,7 +1168,7 @@ class Layer(base_layer.Layer):
     updates are run on the fly and thus do not need to be tracked for later
     execution).
 
-    Arguments:
+    Args:
       updates: Update op, or list/tuple of update ops, or zero-arg callable
         that returns an update op. A zero-arg callable should be passed in
         order to disable running the updates by setting `trainable=False`
@@ -1218,7 +1200,7 @@ class Layer(base_layer.Layer):
     def process_update(x):
       """Standardize update ops.
 
-      Arguments:
+      Args:
         x: Tensor, op, or callable.
 
       Returns:
@@ -1274,7 +1256,7 @@ class Layer(base_layer.Layer):
            [1.],
            [1.]], dtype=float32), array([0.], dtype=float32)]
 
-    Arguments:
+    Args:
         weights: a list of Numpy arrays. The number
             of arrays and their shape must match
             number of the dimensions of the weights
@@ -1368,7 +1350,7 @@ class Layer(base_layer.Layer):
   def get_updates_for(self, inputs):
     """Retrieves updates relevant to a specific set of inputs.
 
-    Arguments:
+    Args:
       inputs: Input tensor or list/tuple of input tensors.
 
     Returns:
@@ -1387,7 +1369,7 @@ class Layer(base_layer.Layer):
   def get_losses_for(self, inputs):
     """Retrieves losses relevant to a specific set of inputs.
 
-    Arguments:
+    Args:
       inputs: Input tensor or list/tuple of input tensors.
 
     Returns:
@@ -1406,7 +1388,7 @@ class Layer(base_layer.Layer):
   def get_input_mask_at(self, node_index):
     """Retrieves the input mask tensor(s) of a layer at a given node.
 
-    Arguments:
+    Args:
         node_index: Integer, index of the node
             from which to retrieve the attribute.
             E.g. `node_index=0` will correspond to the
@@ -1425,7 +1407,7 @@ class Layer(base_layer.Layer):
   def get_output_mask_at(self, node_index):
     """Retrieves the output mask tensor(s) of a layer at a given node.
 
-    Arguments:
+    Args:
         node_index: Integer, index of the node
             from which to retrieve the attribute.
             E.g. `node_index=0` will correspond to the
@@ -1486,7 +1468,7 @@ class Layer(base_layer.Layer):
   def get_input_shape_at(self, node_index):
     """Retrieves the input shape(s) of a layer at a given node.
 
-    Arguments:
+    Args:
         node_index: Integer, index of the node
             from which to retrieve the attribute.
             E.g. `node_index=0` will correspond to the
@@ -1505,7 +1487,7 @@ class Layer(base_layer.Layer):
   def get_output_shape_at(self, node_index):
     """Retrieves the output shape(s) of a layer at a given node.
 
-    Arguments:
+    Args:
         node_index: Integer, index of the node
             from which to retrieve the attribute.
             E.g. `node_index=0` will correspond to the
@@ -1524,11 +1506,11 @@ class Layer(base_layer.Layer):
   def get_input_at(self, node_index):
     """Retrieves the input tensor(s) of a layer at a given node.
 
-    Arguments:
+    Args:
         node_index: Integer, index of the node
             from which to retrieve the attribute.
             E.g. `node_index=0` will correspond to the
-            first time the layer was called.
+            first input node of the layer.
 
     Returns:
         A tensor (or list of tensors if the layer has multiple inputs).
@@ -1542,11 +1524,11 @@ class Layer(base_layer.Layer):
   def get_output_at(self, node_index):
     """Retrieves the output tensor(s) of a layer at a given node.
 
-    Arguments:
+    Args:
         node_index: Integer, index of the node
             from which to retrieve the attribute.
             E.g. `node_index=0` will correspond to the
-            first time the layer was called.
+            first output node of the layer.
 
     Returns:
         A tensor (or list of tensors if the layer has multiple outputs).
@@ -1701,7 +1683,7 @@ class Layer(base_layer.Layer):
 
     This is an alias of `self.__call__`.
 
-    Arguments:
+    Args:
       inputs: Input tensor(s).
       *args: additional positional arguments to be passed to `self.call`.
       **kwargs: additional keyword arguments to be passed to `self.call`.
@@ -2047,7 +2029,7 @@ class Layer(base_layer.Layer):
         - get_input_at
         etc...
 
-    Arguments:
+    Args:
         node_index: Integer index of the node from which
             to retrieve the attribute.
         attr: Exact node attribute name.
@@ -2097,9 +2079,10 @@ class Layer(base_layer.Layer):
         # operations.
         with tf_utils.maybe_init_scope(self):
           self.build(input_shapes)
-      # We must set self.built since user defined build functions are not
-      # constrained to set self.built.
-      self.built = True
+      # We must set also ensure that the layer is marked as built, and the build
+      # shape is stored since user defined build functions may not be calling
+      # `super.build()`
+      Layer.build(self, input_shapes)
 
     # Optionally load weight values specified at layer instantiation.
     if self._initial_weights is not None:
@@ -2123,21 +2106,20 @@ class Layer(base_layer.Layer):
     Returns:
       A dict mapping all sublayers to their `trainable` value.
     """
-    layers = layer_utils.filter_empty_layer_containers(self._layers)
-    # Keep track of each top-level layers' `trainable` as well as the
-    # state of all of its sublayers.
+    layers = self._flatten_layers(include_self=False, recursive=False)
     trainable_state = {self: self.trainable}
-    for layer in layers:
-      trainable_state.update(layer._get_trainable_state())
+    for l in layers:
+      trainable_state.update(l._get_trainable_state())
     return trainable_state
 
   def _set_trainable_state(self, trainable_state):
     """Set `trainable` state for each sublayer."""
-    layers = layer_utils.filter_empty_layer_containers(self._layers)
     if self in trainable_state:
       self.trainable = trainable_state[self]
-    for layer in layers:
-      layer._set_trainable_state(trainable_state)
+    layers = self._flatten_layers(include_self=False, recursive=False)
+    for l in layers:
+      if l in trainable_state:
+        l._set_trainable_state(trainable_state)
 
   @property
   def _obj_reference_counts(self):
@@ -2161,7 +2143,7 @@ class Layer(base_layer.Layer):
       default_value: Object, the default value of the attribute.
     """
     if not hasattr(self, name):
-      super(Layer, self).__setattr__(name, default_value)
+      self.__setattr__(name, default_value)
 
   def __delattr__(self, name):
     # For any super.__delattr__() call, we will directly use the implementation
@@ -2195,8 +2177,8 @@ class Layer(base_layer.Layer):
     if (isinstance(existing_value, Layer)
         or base_layer_utils.has_weights(existing_value)):
       super(tracking.AutoTrackable, self).__setattr__(
-          '_layers',
-          [l for l in self._layers if l is not existing_value])
+          '_self_tracked_trackables',
+          [l for l in self._self_tracked_trackables if l is not existing_value])
     if isinstance(existing_value, tf_variables.Variable):
       super(tracking.AutoTrackable, self).__setattr__(
           '_trainable_weights',
@@ -2244,11 +2226,11 @@ class Layer(base_layer.Layer):
     # Append value to self._layers if relevant
     if (getattr(self, '_auto_track_sub_layers', True) and
         (isinstance(value, Layer) or base_layer_utils.has_weights(value))):
-      self._maybe_create_attribute('_layers', [])
+      self._maybe_create_attribute('_self_tracked_trackables', [])
       # We need to check object identity to avoid de-duplicating empty
       # container types which compare equal.
-      if not any((layer is value for layer in self._layers)):
-        self._layers.append(value)
+      if not any((layer is value for layer in self._self_tracked_trackables)):
+        self._self_tracked_trackables.append(value)
         if hasattr(value, '_use_resource_variables'):
           # Legacy layers (V1 tf.layers) must always use
           # resource variables.
@@ -2283,18 +2265,6 @@ class Layer(base_layer.Layer):
     # Skip the auto trackable from tf.Module to keep status quo. See the comment
     # at __delattr__.
     super(tracking.AutoTrackable, self).__setattr__(name, value)
-
-  def _gather_children_attribute(self, attribute):
-    assert attribute in {
-        'weights', 'trainable_weights', 'non_trainable_weights'
-    }
-    if hasattr(self, '_layers'):
-      nested_layers = layer_utils.filter_empty_layer_containers(
-          self._layers)
-      return list(
-          itertools.chain.from_iterable(
-              getattr(layer, attribute) for layer in nested_layers))
-    return []
 
   # This is a hack so that the is_layer (within
   # training/trackable/layer_utils.py) check doesn't get the weights attr.

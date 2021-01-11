@@ -75,6 +75,11 @@ constexpr char kTFDataResourceTag[] = "tfdata";
 class DatasetBase;
 class SerializationContext;
 
+inline bool IsTFDataFunction(const FunctionDef& func) {
+  auto iter = func.attr().find(data::kTFDataFunction);
+  return (iter != func.attr().end() && iter->second.b());
+}
+
 // Interface for reading values from a key-value store.
 // Used for restoring iterator state. This class is thread safe.
 // Please see comment on IteratorStateWriter for guidance around using the
@@ -1054,6 +1059,12 @@ class DatasetBaseIterator : public IteratorBase {
       int64 now_nanos = EnvTime::NowNanos();
       node_->record_stop(now_nanos);
     }
+  }
+
+  // Returns whether work is currently being recorded, i.e. whether we are
+  // currently between a `RecordStart` and a `RecordStop`.
+  bool IsRecording(IteratorContext* ctx) {
+    return collect_resource_usage(ctx) && node_->is_recording();
   }
 
  private:

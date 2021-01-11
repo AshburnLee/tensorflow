@@ -29,45 +29,9 @@ limitations under the License.
 #include "tensorflow/core/lib/llvm_rtti/llvm_rtti.h"
 #include "tensorflow/core/platform/status.h"
 
-// ========================== Tape Ops ==============================
-
 namespace tensorflow {
 namespace gradients {
 namespace internal {
-// Computes `inputs[0] + inputs[1]` and records it on the tape.
-Status Add(AbstractContext* ctx, Tape* tape,
-           absl::Span<AbstractTensorHandle* const> inputs,
-           absl::Span<AbstractTensorHandle*> outputs,
-           const GradientRegistry& registry);
-
-// Computes `inputs[0] * inputs[1]` for matrices and records it on the tape.
-Status MatMul(AbstractContext* ctx, Tape* tape,
-              absl::Span<AbstractTensorHandle* const> inputs,
-              absl::Span<AbstractTensorHandle*> outputs, const char* name,
-              bool transpose_a, bool transpose_b,
-              const GradientRegistry& registry);
-
-// Computes `inputs[0] * inputs[1]` and records it on the tape.
-Status Mul(AbstractContext* ctx, Tape* tape,
-           absl::Span<AbstractTensorHandle* const> inputs,
-           absl::Span<AbstractTensorHandle*> outputs, const char* name,
-           const GradientRegistry& registry);
-
-// Computes `Relu(inputs[0])` and records it on the tape.
-Status Relu(AbstractContext* ctx, Tape* tape,
-            absl::Span<AbstractTensorHandle* const> inputs,
-            absl::Span<AbstractTensorHandle*> outputs, const char* name,
-            const GradientRegistry& registry);
-
-// Computes `SoftmaxLoss(scores, labels)` for matrices and records it on the
-// tape.
-Status SparseSoftmaxCrossEntropyWithLogits(
-    AbstractContext* ctx, Tape* tape,
-    absl::Span<AbstractTensorHandle* const> inputs,
-    absl::Span<AbstractTensorHandle*> outputs, const char* name,
-    const GradientRegistry& registry);
-
-// ====================== End Tape Ops ============================
 
 // Computes
 // y = inputs[0] + inputs[1]
@@ -97,18 +61,6 @@ Status MatMulTransposeModel(AbstractContext* ctx,
                             absl::Span<AbstractTensorHandle*> outputs,
                             const GradientRegistry& registry);
 
-// Test Model to verify ReluGrad functionality
-Status ReluGradModel(AbstractContext* ctx,
-                     absl::Span<AbstractTensorHandle* const> inputs,
-                     absl::Span<AbstractTensorHandle*> outputs,
-                     const GradientRegistry& registry);
-
-// Test Model to verify SoftmaxGrad functionality
-Status SoftmaxLossGradModel(AbstractContext* ctx,
-                            absl::Span<AbstractTensorHandle* const> inputs,
-                            absl::Span<AbstractTensorHandle*> outputs,
-                            const GradientRegistry& registry);
-
 // Test Model to verify Multi-grad functionality for MNIST
 Status MNISTGradModel(AbstractContext* ctx,
                       absl::Span<AbstractTensorHandle* const> inputs,
@@ -130,11 +82,6 @@ Status MulModel(AbstractContext* ctx,
                 absl::Span<AbstractTensorHandle* const> inputs,
                 absl::Span<AbstractTensorHandle*> outputs,
                 const GradientRegistry& registry);
-
-Status SoftmaxModel(AbstractContext* ctx,
-                    absl::Span<AbstractTensorHandle* const> inputs,
-                    absl::Span<AbstractTensorHandle*> outputs,
-                    const GradientRegistry& registry);
 
 }  // namespace internal
 }  // namespace gradients

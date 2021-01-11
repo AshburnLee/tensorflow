@@ -200,13 +200,15 @@ Status ProcessFunctionLibraryRuntime::GetDeviceContext(
     // "TPU_SYSTEM" indicates that `device` is a CPU.
     return Status::OK();
   }
-  if (device_type == "GPU" || device_type == "TPU") {
+
+  if (device->IsRemoteCallAllowed()) {
     auto* dev_info = flr->device()->tensorflow_gpu_device_info();
     if (dev_info) {
       *device_context = dev_info->default_context;
       return Status::OK();
     }
   }
+
   return errors::Internal("Device type: ", device_type,
                           " is currently unsupported for remote ",
                           "function executions");
@@ -606,6 +608,8 @@ Status ValidateMultiDeviceOptions(
   return Status::OK();
 }
 
+}  // anonymous namespace
+
 Status GetGraphAndArgRets(
     const string& function_name, AttrSlice attrs, const FunctionDef* fdef,
     const FunctionLibraryDefinition* lib_def, std::unique_ptr<Graph>* graph,
@@ -641,8 +645,6 @@ Status GetGraphAndArgRets(
   }
   return Status::OK();
 }
-
-}  // anonymous namespace
 
 Status ProcessFunctionLibraryRuntime::InstantiateMultiDevice(
     const string& function_name, AttrSlice attrs,
@@ -730,13 +732,24 @@ Status ProcessFunctionLibraryRuntime::InstantiateMultiDevice(
       function_name, function_key, ret_node_names.size(),
       lib_def->ReachableDefinitions(*fdef), std::move(ret_types));
 
+  // Do not run function/graph optimization passes for component functions,
+  // since they have already processed the main function.
+  const bool should_run_optimization_passes = !options.is_component_function;
+  if (!should_run_optimization_passes) {
+    VLOG(1) << "Skipping function/graph optimization passes when instantiating "
+               "component function "
+            << function_name;
+  }
+
   // Mapping from a function body node name to the control output name.
   std::unordered_map<string, string> node_name_to_control_ret;
 
   bool control_rets_updated = false;
-  TF_RETURN_IF_ERROR(FunctionOptimizationPassRegistry::Global().Run(
-      *dev_set, options.config_proto, &graph, &data->lib_def_,
-      &control_ret_node_names, &control_rets_updated));
+  if (should_run_optimization_passes) {
+    TF_RETURN_IF_ERROR(FunctionOptimizationPassRegistry::Global().Run(
+        *dev_set, options.config_proto, &graph, &data->lib_def_,
+        &control_ret_node_names, &control_rets_updated));
+  }
 
   if (control_rets_updated) {
     // Function graph pass may have resulted in different nodes/node names for
@@ -761,17 +774,8 @@ Status ProcessFunctionLibraryRuntime::InstantiateMultiDevice(
   optimization_options.device_set = dev_set.get();
   optimization_options.is_function_graph = true;
 
-  // Do not run graph optimization passes for component functions, since they
-  // have already processed the main function.
-  bool should_run_graph_passes = !options.is_component_function;
-  if (!should_run_graph_passes) {
-    VLOG(1) << "Skipping graph optimization passes when instantiating "
-               "component function "
-            << function_name;
-  }
-
   DumpGraph("Before running PRE_PLACEMENT passes", graph.get());
-  if (should_run_graph_passes) {
+  if (should_run_optimization_passes) {
     TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
         OptimizationPassRegistry::PRE_PLACEMENT, optimization_options));
   }
@@ -786,7 +790,7 @@ Status ProcessFunctionLibraryRuntime::InstantiateMultiDevice(
   TF_RETURN_IF_ERROR(placer.Run());
 
   DumpGraph("Before running POST_PLACEMENT passes", graph.get());
-  if (should_run_graph_passes) {
+  if (should_run_optimization_passes) {
     TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
         OptimizationPassRegistry::POST_PLACEMENT, optimization_options));
   }
@@ -807,7 +811,7 @@ Status ProcessFunctionLibraryRuntime::InstantiateMultiDevice(
   }
 
   DumpGraph("Before running POST_REWRITE_FOR_EXEC passes", graph.get());
-  if (should_run_graph_passes) {
+  if (should_run_optimization_passes) {
     TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
         OptimizationPassRegistry::POST_REWRITE_FOR_EXEC, optimization_options));
   }
@@ -845,7 +849,7 @@ Status ProcessFunctionLibraryRuntime::InstantiateMultiDevice(
   // Normally POST_PARTITIONING passes are run by distributed workers.
   // Distributed workers are currently not supported in this code path, so we
   // run the passes here.
-  if (should_run_graph_passes) {
+  if (should_run_optimization_passes) {
     TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
         OptimizationPassRegistry::POST_PARTITIONING, optimization_options));
   }
@@ -991,8 +995,8 @@ Status ProcessFunctionLibraryRuntime::InstantiateMultiDevice(
 }
 
 Status ProcessFunctionLibraryRuntime::GetOutputDevices(
-    FunctionLibraryRuntime::Handle handle, std::vector<Device*>* output_devices,
-    const bool eager_lazy_copy) const {
+    FunctionLibraryRuntime::Handle handle,
+    std::vector<Device*>* output_devices) const {
   MultiDeviceFunctionData* data = IsMultiDevice(handle);
   if (data == nullptr) {
     return errors::InvalidArgument(
@@ -1011,16 +1015,6 @@ Status ProcessFunctionLibraryRuntime::GetOutputDevices(
     Device* target_device = nullptr;
     Device* host = nullptr;
     if (target_flr == nullptr) {
-      if (!eager_lazy_copy) {
-        return errors::Unimplemented(
-            "Currently, outputting tensors on remote devices is not supported."
-            "The ",
-            comp_data.ret_indices[0],
-            "-th return value of the function outputs to target_device: ",
-            target,
-            " Please copy the tensor to local device explicitly using "
-            "tf.identity and return the new Tensor instead.");
-      }
       if (!data->has_remote_outputs) {
         data->has_remote_outputs = true;
       }
@@ -1422,6 +1416,10 @@ void ProcessFunctionLibraryRuntime::Run(
                                       InternalArgs* comp_args) -> Status {
       // "Index"s of _Arg nodes are unique when all arguments are local Tensors.
       for (const auto& it : comp_data.arg_indices) {
+        if (it.index >= args.size()) {
+          return errors::InvalidArgument(
+              "index ", it.index, " is out of range [0, ", args.size(), ")");
+        }
         if (it.sub_index >= 0) {
           const Tensor& t = args[it.index];
           if (t.dtype() != DT_RESOURCE) {

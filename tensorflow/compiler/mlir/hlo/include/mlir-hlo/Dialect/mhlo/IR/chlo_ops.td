@@ -89,10 +89,9 @@ class HLOClient_BroadcastBinaryElementwiseOp<
     OptionalAttr<BroadcastDimAttr>:$broadcast_dimensions
   );
 
-  let builders = [OpBuilder<
-    "OpBuilder &builder, OperationState &result, Value left, Value  right, "
-    "DenseIntElementsAttr broadcast_dimensions"
-  >];
+  let builders = [
+    OpBuilderDAG<(ins "Value":$left, "Value":$right,
+      "DenseIntElementsAttr":$broadcast_dimensions)>];
 
   let results = (outs HLO_Tensor);
 
@@ -360,6 +359,32 @@ def HLOClient_AcosOp : HLOClient_UnaryElementwiseOp<"acos", [],
   }];
 }
 
+def HLOClient_AtanOp : HLOClient_UnaryElementwiseOp<"atan", [],
+    HLO_FpOrComplexTensor> {
+  let summary = "Atan operator";
+
+  let description = [{
+    Returns `Atan(operand)` element-wise.
+
+    $$
+    \atan(x) = \atan2(x, 1)
+    $$
+  }];
+}
+
+def HLOClient_ConjOp : HLOClient_UnaryElementwiseOp<"conj", [],
+    HLO_FpOrComplexTensor> {
+  let summary = "Conj operator";
+
+  let description = [{
+    Returns `Conj(operand)` element-wise.
+
+    $$
+    \conj(x) = (\real(x), \neg(\imag(x)))
+    $$
+  }];
+}
+
 def HLOClient_SinhOp : HLOClient_UnaryElementwiseOp<"sinh", [],
     HLO_FpOrComplexTensor> {
   let summary = "Sinh operation";
@@ -405,6 +430,32 @@ def HLOClient_ConstantLikeOp : HLOClient_Op<"constant_like",
   let hasCanonicalizer = 1;
 }
 
+def HLOClient_ErfOp : HLOClient_UnaryElementwiseOp<"erf",
+    [NoSideEffect, SameOperandsAndResultShape],
+    HLO_FpTensor> {
+  let summary = "Erfc operator";
+
+  let description = [{
+    Computes the Gauss error function of `x` element-wise.
+
+    erf(x) = erf_impl(x)            if |x| < 1
+           = 1 - erfc_impl(x)       otherwise
+  }];
+}
+
+def HLOClient_ErfcOp : HLOClient_UnaryElementwiseOp<"erfc",
+    [NoSideEffect, SameOperandsAndResultShape],
+    HLO_FpTensor> {
+  let summary = "Erfc operator";
+
+  let description = [{
+    Computes an approximation of the error function complement (1 - erf(x)).
+
+    erfc(x) = erfc_impl(x)           if |x| > 1
+            = 1 - erf_impl(x)        otherwise
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Broadcasting compare op
 //===----------------------------------------------------------------------===//
@@ -414,7 +465,10 @@ def HLOClient_BroadcastCompareOp : HLOClient_BroadcastBinaryElementwiseOp<
   string summary = "Compare operator (with optional broadcasting)";
 
   string description = [{
-    Compares `lhs` and `rhs` elementwise according to `comparison_direction`.
+    Compares `lhs` and `rhs` elementwise according to `comparison_direction`
+    and `compare_type`. If unspecified, `compare_type` is FLOAT for float element
+    types, SIGNED for signed element types and UNSIGNED for unsigned element
+    types.
 
     See
     https://www.tensorflow.org/xla/operation_semantics#element-wise_comparison_operations.
@@ -424,14 +478,15 @@ def HLOClient_BroadcastCompareOp : HLOClient_BroadcastBinaryElementwiseOp<
     HLO_Tensor:$lhs,
     HLO_Tensor:$rhs,
     OptionalAttr<BroadcastDimAttr>:$broadcast_dimensions,
-    HLO_ComparisonDirectionAttr:$comparison_direction
+    HLO_ComparisonDirectionAttr:$comparison_direction,
+    OptionalAttr<HLO_ComparisonTypeAttr>:$compare_type
   );
   let results = (outs HLO_PredTensor);
 
-  let builders = [OpBuilder<
-    "OpBuilder &builder, OperationState &result, Value lhs, Value rhs, "
-    "DenseIntElementsAttr broadcast_dimensions, StringAttr comparison_direction"
-  >];
+  let builders = [
+    OpBuilderDAG<(ins "Value":$lhs, "Value":$rhs,
+      "DenseIntElementsAttr":$broadcast_dimensions,
+      "StringAttr":$comparison_direction, CArg<"StringAttr", "{}">:$compare_type)>];
 }
 
 #endif  // CHLO_OPS

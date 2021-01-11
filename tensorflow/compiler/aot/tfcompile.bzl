@@ -162,7 +162,7 @@ def tf_library(
                 "//tensorflow/python/tools:freeze_graph)" +
                 freeze_args
             ),
-            exec_tools = ["//tensorflow/python/tools:freeze_graph"],
+            tools = ["//tensorflow/python/tools:freeze_graph"],
             tags = tags,
         )
         tfcompile_graph = freeze_file

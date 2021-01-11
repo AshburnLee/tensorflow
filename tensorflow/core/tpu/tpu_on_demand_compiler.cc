@@ -88,7 +88,7 @@ class TpuExecutable : public TpuExecutableInterface {
  public:
   TpuExecutable(SE_Executable* se_executable,
                 std::shared_ptr<HloModule> hlo_module)
-      : TpuExecutableInterface(std::move(hlo_module), nullptr, nullptr),
+      : TpuExecutableInterface(std::move(hlo_module)),
         se_executable_(se_executable) {}
 
   ~TpuExecutable() override {
@@ -119,7 +119,6 @@ class TpuExecutable : public TpuExecutableInterface {
       }
 
       ApiConverter::ToC(arg.shape(), &se_args[i]->dynamic_shape);
-      ApiConverter::ToC(arg.host_shape(), &se_args[i]->host_shape);
       const auto& unowned_indices = arg.unowned_indices();
       se_args[i]->unowned_indices_size = unowned_indices.size();
       se_args[i]->unowned_indices = new XLA_ShapeIndex[unowned_indices.size()];
@@ -142,7 +141,6 @@ class TpuExecutable : public TpuExecutableInterface {
     for (int i = 0; i < arguments.size(); ++i) {
       ApiConverter::Free(&se_args[i]->shape_tree.shape);
       ApiConverter::Free(&se_args[i]->dynamic_shape);
-      ApiConverter::Free(&se_args[i]->host_shape);
       delete[] se_args[i]->unowned_indices;
       delete[] se_args[i]->shape_tree.buffers;
       delete se_args[i];
@@ -253,7 +251,7 @@ class TpuCompiler : public Compiler {
   StatusOr<std::unique_ptr<HloModule>> RunHloPasses(
       std::unique_ptr<HloModule> module,
       stream_executor::StreamExecutor* executor,
-      stream_executor::DeviceMemoryAllocator* device_allocator) override {
+      const CompileOptions& options) override {
     XLA_HloModule hlo_module;
     XLA_HloModule result;
     auto cleanup = xla::MakeCleanup([&hlo_module, &result]() {
@@ -263,7 +261,7 @@ class TpuCompiler : public Compiler {
     });
     hlo_module.module_config = HloModuleConfigToC(module->config());
     hlo_module.proto = stream_executor::tpu::SerializeProto(module->ToProto());
-    auto allocator = ApiConverter::ToC(device_allocator);
+    auto allocator = ApiConverter::ToC(options.device_allocator);
     StatusHelper status;
     ExecutorApiFn()->TpuCompiler_RunHloPassesFn(
         compiler_, &hlo_module,
@@ -278,20 +276,10 @@ class TpuCompiler : public Compiler {
     return HloModule::CreateFromProto(result_proto, module->config());
   }
 
-  StatusOr<
-      std::tuple<std::unique_ptr<HloModule>, std::unique_ptr<BufferAssignment>>>
-  RunHloPassesAndBufferAssignement(
-      std::unique_ptr<HloModule> module,
-      stream_executor::StreamExecutor* executor,
-      stream_executor::DeviceMemoryAllocator* device_allocator) override {
-    return Unimplemented(
-        "This compiler does not support RunHloPassesAndBufferAssignment.");
-  }
-
   StatusOr<std::unique_ptr<Executable>> RunBackend(
       std::unique_ptr<HloModule> module,
       stream_executor::StreamExecutor* executor,
-      stream_executor::DeviceMemoryAllocator* device_allocator) override {
+      const CompileOptions& options) override {
     XLA_HloModule hlo_module;
     auto cleanup = xla::MakeCleanup([&hlo_module]() {
       stream_executor::tpu::SerializedProto_Free(hlo_module.proto);
@@ -300,7 +288,7 @@ class TpuCompiler : public Compiler {
     SE_Executable* result;
     hlo_module.module_config = HloModuleConfigToC(module->config());
     hlo_module.proto = stream_executor::tpu::SerializeProto(module->ToProto());
-    auto allocator = ApiConverter::ToC(device_allocator);
+    auto allocator = ApiConverter::ToC(options.device_allocator);
 
     StatusHelper status;
     ExecutorApiFn()->TpuCompiler_RunBackendFn(
@@ -320,7 +308,7 @@ class TpuCompiler : public Compiler {
   StatusOr<std::vector<std::unique_ptr<Executable>>> Compile(
       std::unique_ptr<HloModuleGroup> module_group,
       std::vector<std::vector<stream_executor::StreamExecutor*>> stream_exec,
-      stream_executor::DeviceMemoryAllocator* device_allocator) override {
+      const CompileOptions& options) override {
     XLA_HloModuleGroup se_module_group;
     se_module_group.proto =
         stream_executor::tpu::SerializeProto(module_group->ToProto());
@@ -351,7 +339,8 @@ class TpuCompiler : public Compiler {
       }
     }
 
-    SE_DeviceMemoryAllocator allocator = ApiConverter::ToC(device_allocator);
+    SE_DeviceMemoryAllocator allocator =
+        ApiConverter::ToC(options.device_allocator);
 
     SE_Executable** se_executables = new SE_Executable*[module_group->size()];
 

@@ -39,6 +39,7 @@ from tensorflow.python.distribute import multi_worker_test_base
 from tensorflow.python.distribute import parameter_server_strategy_v2
 from tensorflow.python.distribute import sharded_variable
 from tensorflow.python.distribute import strategy_combinations
+from tensorflow.python.distribute import test_util
 from tensorflow.python.distribute import values
 from tensorflow.python.eager import context
 from tensorflow.python.eager import test
@@ -610,6 +611,27 @@ class PSStrategySaveAndLoadTest(test.TestCase):
     # ShardedVariable loading only works in v1.
     self.assertAllEqual(self.load_and_run_v1(model_dir, {"x": 1}), [6, 6, 6, 6])
 
+    with self.assertRaisesWithLiteralMatch(
+        ValueError, "Loading `ShardedVariable` is not supported"):
+      with strategy.scope():
+        tf.saved_model.load(model_dir)
+
+    with self.assertRaisesWithLiteralMatch(
+        ValueError, "Loading `ShardedVariable` is not supported"):
+      tf.saved_model.load(model_dir)
+
+  def test_load_with_partitioner_raises_error(self):
+    model = self.Model()
+    model_dir = self.get_temp_dir()
+    tf.saved_model.save(model, model_dir)
+
+    strategy = parameter_server_strategy_v2.ParameterServerStrategyV2(
+        self.cluster_resolver, tf1.fixed_size_partitioner(2))
+    with self.assertRaisesRegex(ValueError, "`variable_partitioner`"):
+      with strategy.scope():
+        tf.saved_model.load(model_dir)
+
 
 if __name__ == "__main__":
-  combinations.main()
+  # TODO(b/172304955): enable logical devices.
+  test_util.main(config_logical_devices=False)

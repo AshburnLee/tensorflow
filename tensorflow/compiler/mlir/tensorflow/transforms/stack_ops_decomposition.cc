@@ -26,11 +26,10 @@ limitations under the License.
 #include "mlir/Dialect/StandardOps/IR/Ops.h"  // from @llvm-project
 #include "mlir/IR/Attributes.h"  // from @llvm-project
 #include "mlir/IR/Builders.h"  // from @llvm-project
-#include "mlir/IR/Function.h"  // from @llvm-project
+#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "mlir/IR/BuiltinTypes.h"  // from @llvm-project
 #include "mlir/IR/Location.h"  // from @llvm-project
 #include "mlir/IR/MLIRContext.h"  // from @llvm-project
-#include "mlir/IR/Module.h"  // from @llvm-project
-#include "mlir/IR/StandardTypes.h"  // from @llvm-project
 #include "mlir/IR/SymbolTable.h"  // from @llvm-project
 #include "mlir/IR/TypeUtilities.h"  // from @llvm-project
 #include "mlir/IR/Types.h"  // from @llvm-project
@@ -138,9 +137,9 @@ void ModifyFunctionSignature(
   if (handle_new_size_vars) {
     handle_new_size_vars(func.getArguments().drop_front(original_arg_count));
   }
-  func.setType(FunctionType::get(
-      new_input_types, func.front().getTerminator()->getOperandTypes(),
-      func.getContext()));
+  func.setType(
+      FunctionType::get(func.getContext(), new_input_types,
+                        func.front().getTerminator()->getOperandTypes()));
 }
 
 // Contains cached information for decomposed callee functions for (stateful)
@@ -308,7 +307,7 @@ LogicalResult HandlePartitionedCallOp(
     auto new_call = builder.create<CallOp>(
         call.getLoc(), info.decomposed_callee.getType().getResults(),
         new_operands, call.getAttrs());
-    new_call.setAttr(
+    new_call->setAttr(
         "f", builder.getSymbolRefAttr(
                  const_cast<FuncOp&>(info.decomposed_callee).getName()));
     for (int64_t i = 0; i < call.getNumResults(); ++i) {
@@ -337,7 +336,7 @@ LogicalResult HandlePartitionedCallOp(
   if (!callee.isPrivate()) {
     // Clone non-private callee in case of signature change.
     lowered_callee = callee.clone();
-    lowered_callee.setVisibility(SymbolTable::Visibility::Private);
+    lowered_callee.setPrivate();
   }
   auto find_arg_stack_type = [&](int64_t index) -> llvm::Optional<Type> {
     auto it = data_var_to_size_var.find(call.getOperand(index));
@@ -464,6 +463,38 @@ LogicalResult HandleStackPopV2Op(
   return success();
 }
 
+LogicalResult HandleRegionControlFlowOps(
+    Operation& op, ModuleOp module,
+    llvm::SmallDenseMap<Value, Value>* data_var_to_size_var,
+    llvm::StringMap<PartitionedCallStackOpsInfo>*
+        decomposed_partitioned_call_callees) {
+  for (OpOperand& operand : op.getOpOperands()) {
+    if (getElementTypeOrSelf(operand.get().getType()).isa<TF::ResourceType>()) {
+      return op.emitOpError()
+             << "found unexpected type " << operand.get().getType()
+             << " of operand #" << operand.getOperandNumber()
+             << ", resource type operands are expected to have been "
+                "canonicalized away for region based control flow ops";
+    }
+  }
+  for (OpResult result : op.getResults()) {
+    if (getElementTypeOrSelf(result.getType()).isa<TF::ResourceType>()) {
+      return op.emitOpError()
+             << "found unexpected type " << result.getType() << " of result #"
+             << result.getResultNumber()
+             << ", resource type results are expected to have been "
+                "canonicalized away for region based control flow ops";
+    }
+  }
+  for (Region& region : op.getRegions()) {
+    if (failed(DecomposeStackOpsInternal(&region.front(), module,
+                                         data_var_to_size_var,
+                                         decomposed_partitioned_call_callees)))
+      return failure();
+  }
+  return success();
+}
+
 // Decomposes stack ops on a region and recursively decomposes called functions.
 // data_var_to_size_var: a mapping from stacks' buffer local variables to size
 // local variables.
@@ -505,6 +536,13 @@ LogicalResult DecomposeStackOpsInternal(
                             decomposed_partitioned_call_callees))) {
         return failure();
       }
+    } else if (llvm::isa<TF::WhileRegionOp>(op) ||
+               llvm::isa<TF::IfRegionOp>(op) ||
+               llvm::isa<TF::CaseRegionOp>(op)) {
+      if (failed(
+              HandleRegionControlFlowOps(op, module, data_var_to_size_var,
+                                         decomposed_partitioned_call_callees)))
+        return failure();
     } else if (auto pcall = llvm::dyn_cast<TF::PartitionedCallOp>(&op)) {
       if (!pcall.func()) {
         return pcall.emitOpError(

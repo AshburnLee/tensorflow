@@ -89,10 +89,11 @@ cc_library(
     name = "profiler_impl",
     visibility = ["//tensorflow:__pkg__"],
     deps = [
-        "//tensorflow/core/profiler/internal:annotation_stack_impl",
-        "//tensorflow/core/profiler/internal:profiler_factory_impl",
-        "//tensorflow/core/profiler/internal:traceme_recorder_impl",
+        "//tensorflow/core/profiler/internal/cpu:annotation_stack_impl",
+        "//tensorflow/core/profiler/internal/cpu:traceme_recorder_impl",
+        "//tensorflow/core/profiler/lib:profiler_factory_impl",
         "//tensorflow/core/profiler/lib:profiler_session_impl",
+        "//tensorflow/core/profiler/utils:time_utils_impl",
     ],
     alwayslink = True,
 )
@@ -135,7 +136,6 @@ cc_library(
 filegroup(
     name = "mobile_srcs",
     srcs = [
-        "//tensorflow/core/profiler/internal:mobile_srcs",
         "//tensorflow/core/profiler/lib:mobile_srcs",
     ],
     visibility = ["//tensorflow/core:__pkg__"],

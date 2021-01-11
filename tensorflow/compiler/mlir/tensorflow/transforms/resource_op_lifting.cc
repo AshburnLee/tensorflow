@@ -32,12 +32,11 @@ limitations under the License.
 #include "mlir/IR/Block.h"  // from @llvm-project
 #include "mlir/IR/BlockAndValueMapping.h"  // from @llvm-project
 #include "mlir/IR/Builders.h"  // from @llvm-project
+#include "mlir/IR/BuiltinOps.h"  // from @llvm-project
+#include "mlir/IR/BuiltinTypes.h"  // from @llvm-project
 #include "mlir/IR/Diagnostics.h"  // from @llvm-project
-#include "mlir/IR/Function.h"  // from @llvm-project
-#include "mlir/IR/Module.h"  // from @llvm-project
 #include "mlir/IR/Operation.h"  // from @llvm-project
 #include "mlir/IR/Region.h"  // from @llvm-project
-#include "mlir/IR/StandardTypes.h"  // from @llvm-project
 #include "mlir/IR/SymbolTable.h"  // from @llvm-project
 #include "mlir/IR/TypeUtilities.h"  // from @llvm-project
 #include "mlir/IR/Types.h"  // from @llvm-project
@@ -120,7 +119,7 @@ namespace {
 //   return %read
 // }
 //
-// will be be transformed to:
+// will be transformed to:
 //
 // func @cluster_with_loop() {
 //   %0 = "tf.VarHandleOp"() ...
@@ -159,6 +158,26 @@ Type GetResourceSubtype(Value value) {
   return nullptr;
 }
 
+// Replaces all `tf.VarIsInitializedOp` in a block with a constant true.
+// TODO(b/171039585): Replace this with proper analysis of
+// `tf.VarIsInitializedOp` in regards to resource writes and control flow.
+void SetAllVarIsInitializedToTrue(Block* block) {
+  auto builder = OpBuilder::atBlockBegin(block);
+  TF::ConstOp const_true = nullptr;
+  for (auto op :
+       llvm::make_early_inc_range(block->getOps<TF::VarIsInitializedOp>())) {
+    builder.setInsertionPoint(op);
+    if (!const_true)
+      const_true = builder.create<TF::ConstOp>(
+          op.getLoc(),
+          DenseIntElementsAttr::get(
+              RankedTensorType::get(/*shape=*/{}, builder.getI1Type()), true));
+
+    op.is_initialized().replaceAllUsesWith(const_true);
+    op.erase();
+  }
+}
+
 // Performs store-load forwarding. This effectively removes
 // 1) Any resource loads after a store to that same resource is done
 // 2) Any resource stores except the last one.
@@ -181,8 +200,20 @@ void ForwardStoreToLoad(Block* block) {
       if (!last_store) continue;
 
       // Use stored value in last_store to replace all uses of current resource
-      // load's result, then erase this resource load.
-      read_variable_op.value().replaceAllUsesWith(last_store.value());
+      // load's result, then erase this resource load. Add an intermediate
+      // CastOp if the shape of types doesn't exactly match.
+      Type read_type = read_variable_op.value().getType();
+      if (read_type != last_store.value().getType()) {
+        OpBuilder builder(last_store);
+        builder.setInsertionPointAfter(last_store);
+        auto cast = builder.create<TF::CastOp>(
+            last_store.getLoc(), read_type, last_store.value(),
+            /*Truncate=*/builder.getBoolAttr(false));
+        read_variable_op.value().replaceAllUsesWith(cast);
+      } else {
+        read_variable_op.value().replaceAllUsesWith(last_store.value());
+      }
+
       read_variable_op.erase();
       continue;
     }
@@ -213,7 +244,7 @@ class RegionResourceHoister {
   // Returns all resources accessed by the regions attached the op.
   auto& GetResources() { return resources_; }
 
-  // Returns if the given value is a resouce that needs lifting.
+  // Returns if the given value is a resource that needs lifting.
   bool Contains(Value resource) const {
     return resources_.find(resource) != resources_.end();
   }
@@ -347,7 +378,7 @@ LogicalResult RegionResourceHoister::Analyze() {
       // If the user is not in one of the regions, we are not interested in it.
       // Since all the sub-regions within this region (i.e., regions attached to
       // op's in this region) have themselves gone through lifting, all resource
-      // users are expected to be operations in this region and and not embedded
+      // users are expected to be operations in this region and not embedded
       // within other sub-regions attached to op's in this region. So the check
       // for whether a user is in one of the regions attached to this op is
       // straightforward.
@@ -414,6 +445,7 @@ LogicalResult RegionResourceHoister::Analyze() {
 // Generates hoisted reads for all resources that need them just before the op.
 void RegionResourceHoister::GenerateHoistedReads() {
   OpBuilder builder(op_);
+  DictionaryAttr empty_attrs = builder.getDictionaryAttr({});
   for (auto& resource_it : GetResources()) {
     Value resource = resource_it.first;
     auto& info = resource_it.second;
@@ -421,7 +453,7 @@ void RegionResourceHoister::GenerateHoistedReads() {
     if (info.is_read) {
       Operation* read = builder.create<TF::ReadVariableOp>(
           op_->getLoc(), info.data_type, resource);
-      read->setAttrs(info.read_attrs);
+      read->setAttrs(info.read_attrs ? info.read_attrs : empty_attrs);
       info.hoisted_read = read->getResult(0);
     }
   }
@@ -463,7 +495,7 @@ void RegionResourceHoister::AppendResourceStoreValueToReturn(
     auto new_return_operands = llvm::to_vector<4>(old_return->getOperands());
     new_return_operands.resize(num_new_results_);
 
-    // initialize return values for written resources to be the hosited reads.
+    // initialize return values for written resources to be the hoisted reads.
     for (Value resource : written_resources_) {
       const ResourceInfo& info = resources_[resource];
       new_return_operands[info.result_index] = info.hoisted_read;
@@ -499,7 +531,7 @@ void RegionResourceHoister::ReplaceOpWithNewOp() {
   new_result_types.insert(new_result_types.end(), extra_result_types.begin(),
                           extra_result_types.end());
   OpBuilder builder(op_);
-  // Clone ths old operation but with new result types.
+  // Clone this old operation but with new result types.
   Operation* new_op = Operation::create(
       op_->getLoc(), op_->getName(), new_result_types, op_->getOperands(),
       op_->getAttrs(), op_->getSuccessors(), op_->getNumRegions());
@@ -754,9 +786,9 @@ void RemoveUnusedResourceArgumentsAndForwardedRetvals(
     }
   }
   func_op.eraseArguments(indices_to_erase);
-  func_op.setType(FunctionType::get(
-      new_types, llvm::to_vector<4>(return_op->getOperandTypes()),
-      func_op.getContext()));
+  func_op.setType(
+      FunctionType::get(func_op.getContext(), new_types,
+                        llvm::to_vector<4>(return_op->getOperandTypes())));
 }
 
 // Lifts reads/writes of resource arguments from func_op and changes its
@@ -767,8 +799,6 @@ LogicalResult LiftArgRetResourcesForFunction(
     FuncOp func_op,
     const llvm::SmallDenseMap<int64_t, Type>& resource_data_types,
     llvm::function_ref<void(int64_t, Value)> handle_updated_arg_value) {
-  ForwardStoreToLoad(&func_op.front());
-
   RegionResourceHoister hoister(func_op);
   if (failed(hoister.Analyze())) return failure();
 
@@ -778,7 +808,7 @@ LogicalResult LiftArgRetResourcesForFunction(
   // value to be written.
 
   // Now create read values that will be used to replace each resource that
-  // is read in the function body. These read vaulues are just the same argument
+  // is read in the function body. These read values are just the same argument
   // with type replaced.
   llvm::SmallVector<Value, 4> skipped_args;
   for (auto& it : hoister.GetResources()) {
@@ -812,10 +842,9 @@ LogicalResult LiftArgRetResourcesForFunction(
     assign_variable_op.erase();
   }
 
-  func_op.setType(
-      FunctionType::get(func_op.front().getArgumentTypes(),
-                        func_op.front().getTerminator()->getOperandTypes(),
-                        func_op.getContext()));
+  func_op.setType(FunctionType::get(
+      func_op.getContext(), func_op.front().getArgumentTypes(),
+      func_op.front().getTerminator()->getOperandTypes()));
 
   return success();
 }
@@ -1077,11 +1106,11 @@ LogicalResult HandlePartitionedCallOpCallee(
 
   // Clone the callee before making changes.
   SmallString<64> name_base = callee.getName();
-  auto module = callee.getParentOfType<ModuleOp>();
+  auto module = callee->getParentOfType<ModuleOp>();
   name_base += "_resource_lifted";
   auto name = name_base;
   callee = callee.clone();
-  callee.setVisibility(SymbolTable::Visibility::Private);
+  callee.setPrivate();
   callee.setName(name);
   SymbolTable(module).insert(callee);
   result->lifted_callee = callee;
@@ -1124,9 +1153,9 @@ LogicalResult HandlePartitionedCallOpCallee(
   auto new_return =
       builder.create<ReturnOp>(old_return->getLoc(), old_and_new_retvals);
   old_return->erase();
-  callee.setType(FunctionType::get(
-      callee.getType().getInputs(),
-      llvm::to_vector<4>(new_return.getOperandTypes()), callee.getContext()));
+  callee.setType(
+      FunctionType::get(callee.getContext(), callee.getType().getInputs(),
+                        llvm::to_vector<4>(new_return.getOperandTypes())));
   return success();
 }
 
@@ -1151,7 +1180,7 @@ void UpdatePartitionedCallOpWithNewCallee(
   auto new_call = builder.create<CallOpType>(
       call_op.getLoc(), lifting_info.lifted_callee.getType().getResults(),
       new_operands, call_op.getAttrs());
-  new_call.setAttr(
+  new_call->setAttr(
       "f", builder.getSymbolRefAttr(lifting_info.lifted_callee.getName()));
   AddLoadsStoresOutsideControlFlowOp(
       new_call, lifting_info.arg_data_type_and_updated_output_index);
@@ -1167,7 +1196,7 @@ void UpdatePartitionedCallOpWithNewCallee(
 }
 
 LogicalResult HoistForControlFlow(
-    Block*, ModuleOp,
+    Block*, ModuleOp, bool,
     llvm::SmallDenseMap<llvm::StringRef, PartitionedCallLiftingInfo>*);
 
 // A templated routine for handling both PartitionedCallOp and
@@ -1176,14 +1205,15 @@ LogicalResult HoistForControlFlow(
 // flow, then performs lifting on the callee.
 template <typename CallOpType>
 LogicalResult HandlePartitionedCallOp(
-    CallOpType call_op, FuncOp callee, ModuleOp module,
+    CallOpType call_op, FuncOp callee, ModuleOp module, bool vars_initialized,
     llvm::SmallDenseMap<llvm::StringRef, PartitionedCallLiftingInfo>*
         lifted_callees) {
   auto emplace_res = lifted_callees->try_emplace(callee.getName(),
                                                  PartitionedCallLiftingInfo());
   if (emplace_res.second) {
     // Unseen callee. Perform resource lifting on it.
-    if (failed(HoistForControlFlow(&callee.front(), module, lifted_callees)))
+    if (failed(HoistForControlFlow(&callee.front(), module, vars_initialized,
+                                   lifted_callees)))
       return failure();
 
     if (failed(HandlePartitionedCallOpCallee(
@@ -1198,26 +1228,28 @@ LogicalResult HandlePartitionedCallOp(
 // Hoists resource loads/stores from control flow ops in `block` outside the
 // body/cond/branch/callee functions.
 LogicalResult HoistForControlFlow(
-    Block* block, ModuleOp module,
+    Block* block, ModuleOp module, bool vars_initialized,
     llvm::SmallDenseMap<llvm::StringRef, PartitionedCallLiftingInfo>*
         lifted_partitioned_call_callees) {
+  if (vars_initialized) SetAllVarIsInitializedToTrue(block);
+
   for (Operation& op : llvm::make_early_inc_range(*block)) {
     if (auto while_op = llvm::dyn_cast<TF::WhileOp>(&op)) {
       auto body = while_op.body_function();
       auto cond = while_op.cond_function();
       // Recursively handle the nested control flow.
-      HoistForControlFlow(&body.front(), module,
+      HoistForControlFlow(&body.front(), module, vars_initialized,
                           lifted_partitioned_call_callees);
-      HoistForControlFlow(&cond.front(), module,
+      HoistForControlFlow(&cond.front(), module, vars_initialized,
                           lifted_partitioned_call_callees);
       if (failed(HandleWhileLoop(while_op, body, cond))) return failure();
     } else if (auto if_op = llvm::dyn_cast<TF::IfOp>(&op)) {
       auto then_branch = if_op.then_function();
       auto else_branch = if_op.else_function();
       // Recursively handle the nested control flow.
-      HoistForControlFlow(&then_branch.front(), module,
+      HoistForControlFlow(&then_branch.front(), module, vars_initialized,
                           lifted_partitioned_call_callees);
-      HoistForControlFlow(&else_branch.front(), module,
+      HoistForControlFlow(&else_branch.front(), module, vars_initialized,
                           lifted_partitioned_call_callees);
       if (failed(HandleCaseOrIfOp(if_op, {then_branch, else_branch})))
         return failure();
@@ -1226,7 +1258,7 @@ LogicalResult HoistForControlFlow(
       case_op.get_branch_functions(branch_functions);
       for (FuncOp func : branch_functions) {
         // Recursively handle the nested control flow.
-        HoistForControlFlow(&func.front(), module,
+        HoistForControlFlow(&func.front(), module, vars_initialized,
                             lifted_partitioned_call_callees);
       }
       if (failed(HandleCaseOrIfOp(case_op, branch_functions))) return failure();
@@ -1237,6 +1269,7 @@ LogicalResult HoistForControlFlow(
             "resource lifting does not support call with nested references.");
       }
       if (failed(HandlePartitionedCallOp(call_op, callee, module,
+                                         vars_initialized,
                                          lifted_partitioned_call_callees))) {
         // Nested control flow handling is done in HandlePartitionedCallOp().
         return failure();
@@ -1244,12 +1277,13 @@ LogicalResult HoistForControlFlow(
     } else if (auto call_op =
                    llvm::dyn_cast<TF::StatefulPartitionedCallOp>(&op)) {
       if (failed(HandlePartitionedCallOp(call_op, call_op.func(), module,
+                                         vars_initialized,
                                          lifted_partitioned_call_callees))) {
         return failure();
       }
     } else if (isa<TF::IfRegionOp, TF::CaseRegionOp, TF::WhileRegionOp>(op)) {
       for (Region& region : op.getRegions())
-        HoistForControlFlow(&region.front(), module,
+        HoistForControlFlow(&region.front(), module, vars_initialized,
                             lifted_partitioned_call_callees);
       LogicalResult result = RegionResourceHoister::ReplaceOpWithNewOp(&op);
       if (failed(result)) return failure();
@@ -1277,7 +1311,8 @@ void ResourceOpLiftingPass::runOnOperation() {
   auto walk_result = module.walk([&](FuncOp func_op) {
     return func_op.walk([&](tf_device::ClusterOp cluster) {
       LogicalResult result = HoistForControlFlow(
-          &cluster.GetBody(), module, &lifted_partitioned_call_callees);
+          &cluster.GetBody(), module, /*vars_initialized=*/true,
+          &lifted_partitioned_call_callees);
       if (failed(result)) return WalkResult::interrupt();
       result = RegionResourceHoister::ReplaceOpWithNewOp(cluster);
       if (failed(result)) return WalkResult::interrupt();
@@ -1340,9 +1375,15 @@ LogicalResult ResourceLiftingForFunctionalControlFlow(FuncOp function) {
 
   llvm::SmallDenseMap<llvm::StringRef, PartitionedCallLiftingInfo>
       lifted_partitioned_call_callees;
-  return HoistForControlFlow(&function.front(),
-                             cast<ModuleOp>(function.getParentOp()),
-                             &lifted_partitioned_call_callees);
+  if (failed(HoistForControlFlow(
+          &function.front(), cast<ModuleOp>(function->getParentOp()),
+          /*vars_initialized=*/false, &lifted_partitioned_call_callees)))
+    return failure();
+
+  // Clean up and canonicalize to remove dead local variables as some local
+  // variables might be dead after hoisting resource loads/stores from control
+  // flow ops.
+  return TF::CleanupAndCanonicalizeForResourceOpLifting(function);
 }
 }  // namespace TF
 

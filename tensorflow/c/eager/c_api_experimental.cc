@@ -482,11 +482,6 @@ TFE_MonitoringSamplerCell* TFE_MonitoringGetCellSampler2(
       static_cast<void*>(sampler->sampler->GetCell(label1, label2)));
 }
 
-void TFE_ContextOptionsSetLazyRemoteInputsCopy(TFE_ContextOptions* options,
-                                               bool lazy_copy) {
-  options->lazy_remote_inputs_copy = lazy_copy;
-}
-
 void TFE_ContextOptionsSetTfrt(TFE_ContextOptions* options, bool use_tfrt) {
   options->use_tfrt = use_tfrt;
 }
@@ -637,4 +632,20 @@ void TFE_ContextSetSoftDevicePlacement(TFE_Context* ctx, unsigned char enable,
 void TFE_ContextSetLogDevicePlacement(TFE_Context* ctx, unsigned char enable,
                                       TF_Status* status) {
   tensorflow::unwrap(ctx)->SetLogDevicePlacement(enable);
+}
+
+const char* TFE_TensorHandleDeviceType(TFE_TensorHandle* h, TF_Status* status) {
+  if (h == nullptr) {
+    status->status = tensorflow::errors::InvalidArgument("Invalid handle");
+    return nullptr;
+  }
+  return tensorflow::unwrap(h)->DeviceType(&status->status);
+}
+
+int TFE_TensorHandleDeviceID(TFE_TensorHandle* h, TF_Status* status) {
+  if (h == nullptr) {
+    status->status = tensorflow::errors::InvalidArgument("Invalid handle");
+    return -1;
+  }
+  return tensorflow::unwrap(h)->DeviceId(&status->status);
 }

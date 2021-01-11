@@ -510,6 +510,7 @@ py_test(
         "//tensorflow/python:framework_ops",
         "//tensorflow/python:framework_test_lib",
         "//tensorflow/python:platform_test",
+        "//tensorflow/python:tensor_array_grad",
         "//tensorflow/python:tensor_shape",
         "//tensorflow/python:tensor_spec",
         "//tensorflow/python/data/ops:dataset_ops",
@@ -641,6 +642,9 @@ py_test(
     python_version = "PY3",
     shard_count = 4,
     srcs_version = "PY2AND3",
+    tags = [
+        "notsan",  # TODO(b/170902201): Flaky
+    ],
     deps = [
         ":ragged_factory_ops",
         ":ragged_gather_ops",
@@ -1100,7 +1104,6 @@ py_test(
     srcs = ["ragged_map_fn_op_test.py"],
     python_version = "PY3",
     srcs_version = "PY2AND3",
-    tags = ["no_rocm"],
     deps = [
         ":ragged",  # fixdeps: keep
         ":ragged_factory_ops",

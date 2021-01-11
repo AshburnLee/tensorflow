@@ -953,6 +953,25 @@ class DataHandlerTest(keras_parameterized.TestCase):
     self.assertEqual(returned_data, [[([0],), ([1],),
                                       ([2],)], [([0],), ([1],), ([2],)]])
 
+  def test_iterator(self):
+    def generator():
+      for _ in range(2):
+        for step in range(3):
+          yield (ops.convert_to_tensor_v2_with_dispatch([step]),)
+
+    it = iter(dataset_ops.Dataset.from_generator(
+        generator, output_types=('float32',)))
+    data_handler = data_adapter.DataHandler(it, epochs=2, steps_per_epoch=3)
+    returned_data = []
+    for _, iterator in data_handler.enumerate_epochs():
+      epoch_data = []
+      for _ in data_handler.steps():
+        epoch_data.append(next(iterator))
+      returned_data.append(epoch_data)
+    returned_data = self.evaluate(returned_data)
+    self.assertEqual(returned_data, [[([0],), ([1],), ([2],)],
+                                     [([0],), ([1],), ([2],)]])
+
   def test_list_of_scalars(self):
     data_handler = data_adapter.DataHandler([[0], [1], [2]],
                                             epochs=2,
@@ -1077,6 +1096,7 @@ class ListsOfScalarsDataAdapterTest(DataAdapterTestBase):
     self.assertFalse(self.adapter_cls.can_handle(self.dataset_input))
     self.assertFalse(self.adapter_cls.can_handle(self.generator_input))
     self.assertFalse(self.adapter_cls.can_handle(self.sequence_input))
+    self.assertFalse(self.adapter_cls.can_handle([]))
 
 
 class TestUtils(keras_parameterized.TestCase):

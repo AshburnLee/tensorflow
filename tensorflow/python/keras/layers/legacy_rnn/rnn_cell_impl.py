@@ -40,8 +40,8 @@ from tensorflow.python.keras import initializers
 from tensorflow.python.keras.engine import base_layer_utils
 from tensorflow.python.keras.engine import input_spec
 from tensorflow.python.keras.layers.legacy_rnn import rnn_cell_wrapper_impl
+from tensorflow.python.keras.legacy_tf_layers import base as base_layer
 from tensorflow.python.keras.utils import tf_utils
-from tensorflow.python.layers import base as base_layer
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import clip_ops
 from tensorflow.python.ops import init_ops
@@ -286,7 +286,7 @@ class RNNCell(base_layer.Layer):
       # Validate the given batch_size and dtype against inputs if provided.
       inputs = ops.convert_to_tensor_v2_with_dispatch(inputs, name="inputs")
       if batch_size is not None:
-        if tensor_util.is_tensor(batch_size):
+        if tensor_util.is_tf_type(batch_size):
           static_batch_size = tensor_util.constant_value(
               batch_size, partial=True)
         else:
@@ -345,6 +345,12 @@ class RNNCell(base_layer.Layer):
   # TODO(b/134773139): Remove when contrib RNN cells implement `get_config`
   def get_config(self):  # pylint: disable=useless-super-delegation
     return super(RNNCell, self).get_config()
+
+  @property
+  def _use_input_spec_as_call_signature(self):
+    # We do not store the shape information for the state argument in the call
+    # function for legacy RNN cells, so do not generate an input signature.
+    return False
 
 
 class LayerRNNCell(RNNCell):

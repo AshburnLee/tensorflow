@@ -13,19 +13,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// This file defines the operations used in the LXLA dialect.
+// This file defines the operations used in the LHLO dialect.
 
 #ifndef TENSORFLOW_COMPILER_MLIR_HLO_INCLUDE_MLIR_HLO_DIALECT_MHLO_IR_LHLO_OPS_H_
 #define TENSORFLOW_COMPILER_MLIR_HLO_INCLUDE_MLIR_HLO_DIALECT_MHLO_IR_LHLO_OPS_H_
 
 #include "llvm/ADT/StringRef.h"
+#include "mlir-hlo/Dialect/mhlo/IR/hlo_ops_base_structs.h"
+#include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Operation.h"
-#include "mlir/IR/StandardTypes.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Interfaces/CopyOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -33,11 +35,6 @@ limitations under the License.
 
 namespace mlir {
 class OpBuilder;
-}  // namespace mlir
-
-#include "mlir-hlo/Dialect/mhlo/IR/lhlo_ops_structs.h.inc"
-
-namespace mlir {
 namespace lmhlo {
 
 class LmhloDialect : public Dialect {

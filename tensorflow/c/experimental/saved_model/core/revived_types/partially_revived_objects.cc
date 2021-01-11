@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "tensorflow/c/experimental/saved_model/core/revived_types/partially_revived_objects.h"
 
+#include <algorithm>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include "absl/types/span.h"
@@ -30,13 +32,25 @@ limitations under the License.
 #include "tensorflow/c/experimental/saved_model/core/revived_types/tf_concrete_function_revival_state.h"
 #include "tensorflow/c/experimental/saved_model/core/revived_types/tf_signature_def_function.h"
 #include "tensorflow/c/experimental/saved_model/core/revived_types/tf_signature_def_function_revival_state.h"
+#include "tensorflow/c/experimental/saved_model/core/signature_def_function_metadata.h"
+#include "tensorflow/c/experimental/saved_model/core/tensor_spec.h"
+#include "tensorflow/core/lib/gtl/flatmap.h"
+#include "tensorflow/core/lib/hash/hash.h"
 #include "tensorflow/core/lib/llvm_rtti/llvm_rtti.h"
 #include "tensorflow/core/platform/errors.h"
+#include "tensorflow/core/platform/stringpiece.h"
 #include "tensorflow/core/protobuf/saved_object_graph.pb.h"
+#include "tensorflow/core/protobuf/struct.pb.h"
 
 namespace tensorflow {
 
 namespace {
+
+using StructuredValueDictEntry =
+    protobuf::MapPair<std::string, StructuredValue>;
+
+using NamedParamMap =
+    gtl::FlatMap<StringPiece, const TensorSpecProto*, StringPieceHasher>;
 
 Status AssertAllCreateResourceFunctionsHaveNoCaptures(
     const PartiallyRevivedObjects& objects) {
@@ -124,6 +138,142 @@ Status TensorHandleFromNode(int node_id, const SavedObjectGraph& obj_graph,
   }
 }
 
+std::vector<SignatureDefParam> SignatureDefParamsFromNamedParamMap(
+    const NamedParamMap& params) {
+  // The underlying functiondef associated with the SignatureDef has
+  // nest.flattened inputs and outputs, which are sorted by string key.
+  std::vector<SignatureDefParam> result;
+  result.reserve(params.size());
+  for (const auto& named_param : params) {
+    result.push_back(SignatureDefParam(std::string(named_param.first),
+                                       TensorSpec(*named_param.second)));
+  }
+  std::sort(result.begin(), result.end(),
+            [](const SignatureDefParam& x, const SignatureDefParam& y) {
+              return x.name() < y.name();
+            });
+
+  return result;
+}
+
+// SignatureDefArgsFromInputs takes the "canonicalized_input_signature"
+// field of a SavedConcreteFunction, ensures it conforms to the structure of
+// tuple(tuple(), dict<string,TensorSpec>()), and "returns" a list of
+// SignatureDefParams of the SignatureDefFunction's arguments.
+Status SignatureDefArgsFromInputs(
+    const StructuredValue& canonicalized_input_signature,
+    std::vector<SignatureDefParam>* out) {
+  // Note(bmzhao): canonicalized_input_signature should be a tuple of
+  // (args, kwargs), where args is an empty tuple, and kwargs is a dictionary of
+  // string keys to TensorSpecs.
+  if (!canonicalized_input_signature.has_tuple_value()) {
+    return errors::FailedPrecondition(
+        "SignatureDefFunction's canonicalized_input_signature should be "
+        "of form tuple(tuple(), dict()), but was instead: \n",
+        canonicalized_input_signature.DebugString());
+  }
+
+  const TupleValue& args_kwargs_tuple =
+      canonicalized_input_signature.tuple_value();
+  if (args_kwargs_tuple.values_size() != 2) {
+    return errors::FailedPrecondition(
+        "SignatureDefFunction's canonicalized_input_signature should be "
+        "a tuple of two elements (args, kwargs), but was instead: \n",
+        args_kwargs_tuple.DebugString());
+  }
+
+  const StructuredValue& args = args_kwargs_tuple.values(0);
+  if (!args.has_tuple_value() || !args.tuple_value().values().empty()) {
+    return errors::FailedPrecondition(
+        "SignatureDefFunction's canonicalized_input_signature's args"
+        "should be an empty tuple, but instead got: \n",
+        args.DebugString());
+  }
+
+  const StructuredValue& kwargs = args_kwargs_tuple.values(1);
+  if (!kwargs.has_dict_value()) {
+    return errors::FailedPrecondition(
+        "SignatureDefFunction's canonicalized_input_signature's kwargs"
+        "should be a dictionary, but instead got: \n",
+        kwargs.DebugString());
+  }
+
+  const DictValue& kwargs_dict = kwargs.dict_value();
+  NamedParamMap result;
+  result.reserve(kwargs_dict.fields_size());
+
+  for (const auto& key_value : kwargs_dict.fields()) {
+    const std::string& key = key_value.first;
+    const StructuredValue& value = key_value.second;
+    if (!value.has_tensor_spec_value()) {
+      return errors::FailedPrecondition(
+          "SignatureDefFunction's canonicalized_input_signature's kwargs"
+          "dictionary contained a non-tensorspec value for key-value pair: \n",
+          "Key: ", key, "Value: \n", value.DebugString());
+    }
+    result[key] = &value.tensor_spec_value();
+  }
+
+  *out = SignatureDefParamsFromNamedParamMap(result);
+
+  return Status();
+}
+
+// SignatureDefReturnsFromOutputs takes the "output_signature" field of a
+// SavedConcreteFunction, ensures it conforms to the structure of
+// dict<string,TensorSpec>(), and "returns" a list of SignatureDefParams of the
+// SignatureDefFunction's returns.
+Status SignatureDefReturnsFromOutputs(const StructuredValue& output_signature,
+                                      std::vector<SignatureDefParam>* out) {
+  if (!output_signature.has_dict_value()) {
+    return errors::FailedPrecondition(
+        "SignatureDefFunction's output_signature must be a dictionary, but "
+        "instead got: ",
+        output_signature.DebugString());
+  }
+
+  const DictValue& output_dict = output_signature.dict_value();
+  NamedParamMap result;
+  result.reserve(output_dict.fields_size());
+
+  for (const auto& key_value : output_dict.fields()) {
+    const std::string& key = key_value.first;
+    const StructuredValue& value = key_value.second;
+    if (!value.has_tensor_spec_value()) {
+      return errors::FailedPrecondition(
+          "SignatureDefFunction's output_signature dictionary contained a "
+          "non-tensorspec value for key-value pair: \n",
+          "Key: ", key, "Value: \n", value.DebugString());
+    }
+    result[key] = &value.tensor_spec_value();
+  }
+  *out = SignatureDefParamsFromNamedParamMap(result);
+
+  return Status();
+}
+
+// The implementation takes advantage of the fact that SignatureDefFunction's
+// "traced" Signature wrapper function always has inputs/outputs of dictionaries
+// https://github.com/tensorflow/tensorflow/blob/53cdd5e87c423b195f33775753273286fd5a1a65/tensorflow/python/saved_model/signature_serialization.py#L119-L126
+// https://github.com/tensorflow/tensorflow/blob/53cdd5e87c423b195f33775753273286fd5a1a65/tensorflow/python/saved_model/signature_serialization.py#L153-L178
+// Additionally, we take advantage of the fact that the SignatureDefFunction's
+// associated functiondef has lexicographically ordered inputs/outputs due to
+// nest.flatten.
+Status LoadSignatureDefFunctionMetadata(
+    const SavedConcreteFunction& saved_concrete_function,
+    SignatureDefFunctionMetadata* out) {
+  std::vector<SignatureDefParam> args;
+  TF_RETURN_IF_ERROR(SignatureDefArgsFromInputs(
+      saved_concrete_function.canonicalized_input_signature(), &args));
+
+  std::vector<SignatureDefParam> rets;
+  TF_RETURN_IF_ERROR(SignatureDefReturnsFromOutputs(
+      saved_concrete_function.output_signature(), &rets));
+
+  *out = SignatureDefFunctionMetadata(std::move(args), std::move(rets));
+  return Status();
+}
+
 // This function finds the necessary captures, then forwards to the builder
 // method
 Status CreateConcreteFunction(ImmediateExecutionContext* ctx,
@@ -162,10 +312,14 @@ Status CreateSignatureDefFunction(
                                             &capture_handle));
     captures.push_back(capture_handle);
   }
-  // TODO(bmzhao): Create Metadata here
+
+  SignatureDefFunctionMetadata metadata;
+  TF_RETURN_IF_ERROR(LoadSignatureDefFunctionMetadata(
+      *builder.saved_concrete_func, &metadata));
+
   return TFSignatureDefFunction::Create(/*function_def=*/builder.fdef,
                                         /*captures=*/std::move(captures),
-                                        /*metadata=*/{},
+                                        /*metadata=*/std::move(metadata),
                                         /*ctx=*/ctx,
                                         /*out=*/out);
 }
@@ -189,7 +343,8 @@ Status InitializeCreateResourceFunctions(ImmediateExecutionContext* ctx,
     std::unique_ptr<TFConcreteFunction> out;
     TF_RETURN_IF_ERROR(CreateConcreteFunction(ctx, *create_resource_fn,
                                               obj_graph, objects, &out));
-    revived->concrete_functions[create_resource_fn->node_id] = std::move(out);
+    revived->concrete_functions.Insert(std::move(out),
+                                       create_resource_fn->node_id);
   }
   return Status();
 }
@@ -198,8 +353,6 @@ Status InitializeAllFunctions(ImmediateExecutionContext* ctx,
                               const SavedObjectGraph& obj_graph,
                               const PartiallyRevivedObjects& objects,
                               RevivedObjects* revived) {
-  gtl::FlatMap<int, std::unique_ptr<TFConcreteFunction>>* destination_func_map =
-      &revived->concrete_functions;
   gtl::FlatMap<int, std::unique_ptr<TFSignatureDefFunction>>*
       destination_sig_map = &revived->signature_def_functions;
 
@@ -207,7 +360,7 @@ Status InitializeAllFunctions(ImmediateExecutionContext* ctx,
     int node_id = id_and_func.first;
     const TFConcreteFunctionRevivalState& func = id_and_func.second;
 
-    if (destination_func_map->find(node_id) != destination_func_map->end()) {
+    if (revived->concrete_functions.Find(node_id)) {
       // The function has already been initialized in the destination_map,
       // so we can skip this node. This can occur because we initialize
       // CreateResource functions before calling this function.
@@ -217,7 +370,7 @@ Status InitializeAllFunctions(ImmediateExecutionContext* ctx,
     std::unique_ptr<TFConcreteFunction> out;
     TF_RETURN_IF_ERROR(
         CreateConcreteFunction(ctx, func, obj_graph, objects, &out));
-    (*destination_func_map)[node_id] = std::move(out);
+    revived->concrete_functions.Insert(std::move(out), node_id);
   }
 
   for (const auto& id_and_func : objects.signature_def_functions) {
@@ -244,20 +397,16 @@ Status CreateAllResourceHandles(ImmediateExecutionContext* ctx,
   for (auto& id_and_resource : objects->restored_resources) {
     RestoredResourceRevivalState& resource = id_and_resource.second;
     int create_resource_fn_node = resource.create_resource->node_id;
-    const gtl::FlatMap<int, std::unique_ptr<TFConcreteFunction>>&
-        revived_functions = revived->concrete_functions;
 
-    const auto& revived_functions_iter =
-        revived_functions.find(create_resource_fn_node);
-    if (revived_functions_iter == revived_functions.end()) {
+    const TFConcreteFunction* create_resource_fn =
+        revived->concrete_functions.Find(create_resource_fn_node);
+    if (create_resource_fn == nullptr) {
       return errors::FailedPrecondition(
           "ConcreteFunction at node ", create_resource_fn_node,
           " should have been initialized prior to being called.");
     }
-    const TFConcreteFunction& create_resource_fn =
-        *revived_functions_iter->second;
     ImmediateOpPtr function_op;
-    TF_RETURN_IF_ERROR(create_resource_fn.MakeCallOp({}, &function_op));
+    TF_RETURN_IF_ERROR(create_resource_fn->MakeCallOp({}, &function_op));
     TF_RETURN_IF_ERROR(function_op->SetDeviceName(resource.device.c_str()));
 
     AbstractTensorHandle* resource_handle = nullptr;
@@ -277,21 +426,6 @@ Status CreateAllResourceHandles(ImmediateExecutionContext* ctx,
   return Status();
 }
 
-// Finds a ConcreteFunction with node id `node` in `objects`, and sets *out to
-// point to it. If node doesn't exist in `objects`, out is untouched, and an
-// error status is returned.
-Status FindConcreteFunction(int node, RevivedObjects* objects,
-                            TFConcreteFunction** out) {
-  auto func_iter = objects->concrete_functions.find(node);
-  if (func_iter == objects->concrete_functions.end()) {
-    return errors::FailedPrecondition(
-        "Failed to find ConcreteFunction with node id ", node,
-        " in revived objects");
-  }
-  *out = func_iter->second.get();
-  return Status();
-}
-
 Status BuildResources(ImmediateExecutionContext* ctx,
                       const SavedObjectGraph& obj_graph,
                       PartiallyRevivedObjects* objects,
@@ -306,22 +440,35 @@ Status BuildResources(ImmediateExecutionContext* ctx,
     // Check all the functions associated with the resource have already been
     // initialized in `revived`
     if (resource_revival_state.create_resource != nullptr) {
-      TF_RETURN_IF_ERROR(
-          FindConcreteFunction(resource_revival_state.create_resource->node_id,
-                               revived, &create_resource));
+      create_resource = revived->concrete_functions.Find(
+          resource_revival_state.create_resource->node_id);
+      if (create_resource == nullptr) {
+        return errors::FailedPrecondition(
+            "'create_resource' function with node id ",
+            resource_revival_state.create_resource->node_id, " not found");
+      }
     }
 
     TFConcreteFunction* initialize = nullptr;
     if (resource_revival_state.initialize != nullptr) {
-      TF_RETURN_IF_ERROR(FindConcreteFunction(
-          resource_revival_state.initialize->node_id, revived, &initialize));
+      initialize = revived->concrete_functions.Find(
+          resource_revival_state.initialize->node_id);
+      if (initialize == nullptr) {
+        return errors::FailedPrecondition(
+            "'initialize' function with node id ",
+            resource_revival_state.initialize->node_id, " not found");
+      }
     }
 
     TFConcreteFunction* destroy_resource = nullptr;
     if (resource_revival_state.destroy_resource != nullptr) {
-      TF_RETURN_IF_ERROR(
-          FindConcreteFunction(resource_revival_state.destroy_resource->node_id,
-                               revived, &destroy_resource));
+      destroy_resource = revived->concrete_functions.Find(
+          resource_revival_state.destroy_resource->node_id);
+      if (destroy_resource == nullptr) {
+        return errors::FailedPrecondition(
+            "'destroy_resource' function with node id ",
+            resource_revival_state.destroy_resource->node_id, " not found");
+      }
     }
 
     if (resource_revival_state.resource_handle == nullptr) {
@@ -378,6 +525,7 @@ Status PartiallyRevivedObjects::Build(ImmediateExecutionContext* ctx,
   revived->variables = std::move(variables);
   revived->assets = std::move(assets);
   revived->constants = std::move(constants);
+  revived->signatures_map = std::move(signatures_map);
 
   // 3b. Move over resources.
   TF_RETURN_IF_ERROR(BuildResources(ctx, obj_graph, this, revived));

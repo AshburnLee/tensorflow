@@ -41,6 +41,20 @@ struct TPUOutsideCompilationCluster
                      const TF::SideEffectAnalysis::Info& side_effect_analysis);
 };
 
+bool IsVariant(Value value) {
+  return getElementTypeOrSelf(value.getType()).isa<TF::VariantType>();
+}
+
+bool HasOutsideCompiledAncestor(Operation* op) {
+  Operation* parent = op->getParentOp();
+  while (parent) {
+    if (parent->getAttrOfType<StringAttr>(kXlaOutsideCompilationAttr))
+      return true;
+    parent = parent->getParentOp();
+  }
+  return false;
+}
+
 // Represents an outside compiled cluster. All ops that are added to the same
 // cluster will be extracted together in a later pass.
 class OutsideCompiledCluster {
@@ -62,38 +76,92 @@ class OutsideCompiledCluster {
     return false;
   }
 
+  // If any tf.variants are inputs/outputs to the cluster, add them to the
+  // cluster unless they are already marks with outside compilation attribute.
+  bool AddVariantInputsOutputs() {
+    bool added_op = false;
+    llvm::SmallPtrSet<Operation*, 8> expanded_cluster_ops(host_cluster_ops_);
+    for (Operation* cluster_op : host_cluster_ops_) {
+      // Walk the clustered operations to handle nested ops.
+      cluster_op->walk([&](Operation* op) {
+        // Add any operations that provide variant inputs to the cluster.
+        for (auto value : op->getOperands()) {
+          auto input_defining_op = value.getDefiningOp();
+          if (IsVariant(value) && input_defining_op &&
+              !HasOutsideCompiledAncestor(input_defining_op) &&
+              !input_defining_op->getAttrOfType<StringAttr>(
+                  kXlaOutsideCompilationAttr)) {
+            expanded_cluster_ops.insert(input_defining_op);
+            input_defining_op->setAttr(
+                kXlaOutsideCompilationAttr,
+                StringAttr::get(cluster_name_,
+                                input_defining_op->getContext()));
+            added_op = true;
+          }
+        }
+        // Add any operations that consume variant outputs to the cluster.
+        for (auto value : op->getResults()) {
+          if (IsVariant(value)) {
+            for (auto user : value.getUsers()) {
+              if (!host_cluster_ops_.contains(user) &&
+                  !HasOutsideCompiledAncestor(user) &&
+                  !user->getAttrOfType<StringAttr>(
+                      kXlaOutsideCompilationAttr)) {
+                expanded_cluster_ops.insert(user);
+                user->setAttr(
+                    kXlaOutsideCompilationAttr,
+                    StringAttr::get(cluster_name_, user->getContext()));
+                added_op = true;
+              }
+            }
+          }
+        }
+      });
+    }
+    host_cluster_ops_.swap(expanded_cluster_ops);
+
+    return added_op;
+  }
+
  private:
-  // Checks if it is safe for an op to be merged into this cluster.
+  // TODO(hinsu): Consider using GraphCycles data structure available in xla
+  // directory to avoid potentially full traversal for each new op and cluster
+  // pair.
+  // Checks if it is safe for `op` to be merged into this cluster.
   bool IsSafeToAdd(Operation* op,
                    const TF::SideEffectAnalysis::Info& side_effect_analysis) {
-    if (closed_) return false;
-    // If the op is not marked for outside compilation it doesn't belong in a
-    // cluster.
-    if (!op->getAttrOfType<StringAttr>(kXlaOutsideCompilationAttr)) {
-      auto successors = side_effect_analysis.DirectControlSuccessors(op);
-      // If non outside compiled op with side effect successors is encountered,
-      // close this cluster to additions so that no cluster cyclic dependencies
-      // can be created.
-      if (!successors.empty()) {
-        closed_ = true;
-      }
-      return false;
-    }
-
     if (host_cluster_ops_.empty()) return true;
 
-    // Checks to see if there is data dependency between ops in
-    // `host_cluster_ops_` and `op`.
-    const bool contains_data_dependency = llvm::any_of(
-        op->getUsers(),
-        [&](Operation* user) { return host_cluster_ops_.contains(user); });
+    // If there is an intermediate data or side effect dependency between the op
+    // and ops in the cluster, it's not safe to add.
+    std::vector<Operation*> dependencies;
 
-    const bool inside_same_block =
-        llvm::all_of(host_cluster_ops_, [&](Operation* op_in_cluster) {
-          return op_in_cluster->getBlock() == op->getBlock();
-        });
+    // Materialize data dependencies as the llvm::concat doesn't support
+    // non-materialized iteration.
+    auto data_deps = llvm::to_vector<4>(op->getUsers());
+    llvm::SmallVector<Operation*, 4> control_deps =
+        side_effect_analysis.DirectControlSuccessors(op);
+    for (auto* dep : llvm::concat<Operation*>(data_deps, control_deps)) {
+      if (!host_cluster_ops_.contains(dep)) dependencies.push_back(dep);
+    }
 
-    return inside_same_block && contains_data_dependency;
+    llvm::SmallPtrSet<Operation*, 4> visited;
+    while (!dependencies.empty()) {
+      Operation* next_op = dependencies.back();
+      dependencies.pop_back();
+      if (visited.count(next_op)) continue;
+      visited.insert(next_op);
+
+      auto data_deps = llvm::to_vector<4>(next_op->getUsers());
+      llvm::SmallVector<Operation*, 4> control_deps =
+          side_effect_analysis.DirectControlSuccessors(next_op);
+      for (auto* dep : llvm::concat<Operation*>(data_deps, control_deps)) {
+        if (host_cluster_ops_.contains(dep)) return false;
+        dependencies.push_back(dep);
+      }
+    }
+
+    return true;
   }
 
   // `host_cluster_op_` stores a set of ops that will be grouped and computed
@@ -102,7 +170,6 @@ class OutsideCompiledCluster {
   // cluster.
   llvm::SmallPtrSet<Operation*, 8> host_cluster_ops_;
   std::string cluster_name_;
-  bool closed_ = false;  // Cluster is closed to further additions.
 };
 
 void TPUOutsideCompilationCluster::runOnFunction(
@@ -111,14 +178,15 @@ void TPUOutsideCompilationCluster::runOnFunction(
   int cluster_counter = 0;
 
   func.walk([&](tf_device::ClusterOp tpu_cluster) {
-    llvm::SmallVector<Operation*, 4> tpu_cluster_ops;
-    tpu_cluster_ops.reserve(tpu_cluster.getBody()->getOperations().size());
-
-    tpu_cluster.walk([&](Operation* op) { tpu_cluster_ops.emplace_back(op); });
+    llvm::SmallVector<Operation*, 4> outside_ops;
+    tpu_cluster.walk([&](Operation* op) {
+      if (op->getAttrOfType<StringAttr>(kXlaOutsideCompilationAttr))
+        outside_ops.emplace_back(op);
+    });
 
     // In order to cluster ops feeding results to the same operation, traverse
     // the ops in reverse order.
-    for (Operation* op : llvm::reverse(tpu_cluster_ops)) {
+    for (Operation* op : llvm::reverse(outside_ops)) {
       // Try to add the op to existing clusters.
       bool added = false;
       for (auto& cluster : clusters)
@@ -132,6 +200,10 @@ void TPUOutsideCompilationCluster::runOnFunction(
       }
     }
   });
+  for (auto& cluster : clusters) {
+    bool variants_to_add = true;
+    while (variants_to_add) variants_to_add = cluster.AddVariantInputsOutputs();
+  }
 }
 
 }  // anonymous namespace

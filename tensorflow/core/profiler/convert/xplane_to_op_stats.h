@@ -18,6 +18,7 @@ limitations under the License.
 
 #include "absl/container/flat_hash_set.h"
 #include "tensorflow/core/platform/status.h"
+#include "tensorflow/core/profiler/protobuf/hardware_types.pb.h"
 #include "tensorflow/core/profiler/protobuf/op_stats.pb.h"
 #include "tensorflow/core/profiler/protobuf/xplane.pb.h"
 
@@ -33,11 +34,14 @@ struct OpStatsOptions {
 
 // NOTE: call GroupTfEvents before if OpStats.step_db needs to be generated.
 OpStats ConvertXSpaceToOpStats(const XSpace& space,
-                               const OpStatsOptions& config);
+                               const OpStatsOptions& options);
 
 // Propagate and dedup the diagnostics in XSpace and add to OpStats.
 void PropagateXSpaceDiagnosticsToOpStats(const XSpace& space,
                                          OpStats* op_stats);
+
+// Extracts DeviceCapabilities from XPlane stats.
+DeviceCapabilities GetDeviceCapFromXPlane(const XPlane& device_plane);
 
 // Populates PerfEnv.
 PerfEnv MakePerfEnv(double peak_tera_flops_per_second,

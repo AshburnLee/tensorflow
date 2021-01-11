@@ -85,7 +85,7 @@ TEST(PrefetchAutotuner, StartWithMin) {
   EXPECT_EQ(2, t.buffer_limit());
   t.RecordConsumption(0);  // Expect buffer limit to stay the same!
   EXPECT_EQ(2, t.buffer_limit());
-  t.RecordConsumption(2);
+  t.RecordConsumption(2);  // Expect buffer limit to stay the same!
   EXPECT_EQ(2, t.buffer_limit());
   t.RecordConsumption(0);  // Expect buffer limit to increase.
   EXPECT_EQ(4, t.buffer_limit());

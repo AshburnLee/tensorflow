@@ -281,6 +281,22 @@ PartitionConvolutionWithSpatialDimensionHaloExchangeOnRHS(
     rhs = rhs.Reshard(aligned_rhs_sharding).PadWithValue(zero);
   }
 
+  if (original_hlo->feature_group_count() > 1 &&
+      (lhs.sharding().tile_assignment().dim(dnums.input_feature_dimension()) >
+           1 ||
+       rhs.sharding().tile_assignment().dim(
+           dnums.kernel_output_feature_dimension()) > 1)) {
+    return nullptr;
+  }
+
+  if (original_hlo->batch_group_count() > 1 &&
+      (lhs.sharding().tile_assignment().dim(dnums.input_batch_dimension()) >
+           1 ||
+       rhs.sharding().tile_assignment().dim(
+           dnums.kernel_output_feature_dimension()) > 1)) {
+    return nullptr;
+  }
+
   // Reshard RHS so that each shard computes the partial sum of the full
   // shape result, and add AllReduce. See HandleConvolutionTiledLhsAndRhs()
   // that reshards LHS.
@@ -573,6 +589,22 @@ PartitionConvolutionWithSpatialDimensionHaloExchangeOnLHS(
     lhs = lhs.PadWithValue(zero);
     rhs =
         rhs.Reshard(aligned_rhs_sharding).PadWithValue(zero, reversed_rhs_dims);
+  }
+
+  if (original_hlo->feature_group_count() > 1 &&
+      (lhs.sharding().tile_assignment().dim(dnums.input_feature_dimension()) >
+           1 ||
+       rhs.sharding().tile_assignment().dim(
+           dnums.kernel_output_feature_dimension()) > 1)) {
+    return nullptr;
+  }
+
+  if (original_hlo->batch_group_count() > 1 &&
+      (lhs.sharding().tile_assignment().dim(dnums.input_batch_dimension()) >
+           1 ||
+       rhs.sharding().tile_assignment().dim(
+           dnums.kernel_output_feature_dimension()) > 1)) {
+    return nullptr;
   }
   // Reshard LHS by exchanging halo such that each shard computes the partial
   // sum of the full shape result, and add AllReduce.
@@ -918,7 +950,8 @@ StatusOr<std::unique_ptr<HloInstruction>> CreateShardedConvConvolution(
       Shape sharded_conv_shape,
       ShapeInference::InferConvolveShape(
           sharded_lhs_hlo->shape(), sharded_rhs_hlo->shape(),
-          feature_group_count, batch_group_count, window, conv_dnums));
+          feature_group_count, batch_group_count, window, conv_dnums,
+          /*preferred_element_type=*/conv.shape().element_type()));
   *sharded_conv_shape.mutable_layout() = conv.shape().layout();
   return HloInstruction::CreateConvolve(
       sharded_conv_shape, sharded_lhs_hlo, sharded_rhs_hlo, feature_group_count,

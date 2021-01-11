@@ -50,7 +50,7 @@ def serialize(optimizer):
 def deserialize(config, custom_objects=None):
   """Inverse of the `serialize` function.
 
-  Arguments:
+  Args:
       config: Optimizer configuration dictionary.
       custom_objects: Optional dictionary mapping names (strings) to custom
         objects (classes and functions) to be considered during deserialization.
@@ -60,7 +60,7 @@ def deserialize(config, custom_objects=None):
   """
   # loss_scale_optimizer has a direct dependency of optimizer, import here
   # rather than top to avoid the cyclic dependency.
-  from tensorflow.python.keras.mixed_precision.experimental import loss_scale_optimizer  # pylint: disable=g-import-not-at-top
+  from tensorflow.python.keras.mixed_precision import loss_scale_optimizer  # pylint: disable=g-import-not-at-top
   all_classes = {
       'adadelta': adadelta_v2.Adadelta,
       'adagrad': adagrad_v2.Adagrad,
@@ -71,6 +71,10 @@ def deserialize(config, custom_objects=None):
       'sgd': gradient_descent_v2.SGD,
       'ftrl': ftrl.Ftrl,
       'lossscaleoptimizer': loss_scale_optimizer.LossScaleOptimizer,
+      # LossScaleOptimizerV1 deserializes into LossScaleOptimizer, as
+      # LossScaleOptimizerV1 will be removed soon but deserializing it will
+      # still be supported.
+      'lossscaleoptimizerv1': loss_scale_optimizer.LossScaleOptimizer,
   }
 
   # Make deserialization case-insensitive for built-in optimizers.
@@ -87,7 +91,7 @@ def deserialize(config, custom_objects=None):
 def get(identifier):
   """Retrieves a Keras Optimizer instance.
 
-  Arguments:
+  Args:
       identifier: Optimizer identifier, one of
           - String: name of an optimizer
           - Dictionary: configuration dictionary. - Keras Optimizer instance (it
